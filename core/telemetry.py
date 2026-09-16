@@ -374,6 +374,63 @@ def create_genai_metrics(meter: Any) -> dict:
     }
 
 
+# GenAI instruments, created on first record. Only cached once the real
+# MeterProvider is installed: get_meter() before init_telemetry() returns
+# _FallbackNoOpMeter, and caching that would silence the counters for the
+# life of the process.
+_genai_metrics: Optional[dict] = None
+
+
+def record_llm_call(
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    duration_s: float,
+    cost_usd: float,
+) -> None:
+    """
+    Record one completed LLM call on the four GenAI instruments.
+
+    Attributes are limited to ``model`` / ``provider`` (plus ``token_type`` on
+    the token counter) — never prompt or response content. Runs on the
+    request path, so it swallows every exception; it is a no-op when OTEL is
+    disabled.
+    """
+    global _genai_metrics
+    try:
+        # Normalise everything before touching any instrument so a bad value
+        # skips the whole record rather than leaving the four out of step.
+        tokens = {
+            "input": int(input_tokens or 0),
+            "output": int(output_tokens or 0),
+            "cache_read": int(cache_read_tokens or 0),
+            "cache_creation": int(cache_creation_tokens or 0),
+        }
+        duration = max(float(duration_s or 0.0), 0.0)
+        cost = max(float(cost_usd or 0.0), 0.0)
+        attrs = {"model": model or "unknown", "provider": provider or "unknown"}
+
+        metrics = _genai_metrics
+        if metrics is None:
+            meter = get_meter("vigil.llm")
+            metrics = create_genai_metrics(meter)
+            if _initialized and not isinstance(meter, _FallbackNoOpMeter):
+                _genai_metrics = metrics
+
+        metrics["llm_calls"].add(1, attrs)
+        metrics["llm_duration"].record(duration, attrs)
+        metrics["llm_cost_usd"].add(cost, attrs)
+        for token_type, count in tokens.items():
+            if count:
+                metrics["llm_tokens"].add(count, {**attrs, "token_type": token_type})
+    except Exception:
+        pass
+
+
 def shutdown() -> None:
     """
     Flush and shut down all telemetry providers.
@@ -381,7 +438,7 @@ def shutdown() -> None:
     Safe to call even when OTEL was never initialized.
     After shutdown, init_telemetry() may be called again.
     """
-    global _initialized, _tracer_provider, _meter_provider
+    global _initialized, _tracer_provider, _meter_provider, _genai_metrics
 
     if _tracer_provider is not None:
         try:
@@ -399,6 +456,7 @@ def shutdown() -> None:
 
     _tracer_provider = None
     _meter_provider = None
+    _genai_metrics = None  # instruments belong to the provider just shut down
     _initialized = False  # reset so init_telemetry() can be called again
 
 
