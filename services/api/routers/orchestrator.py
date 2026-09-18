@@ -92,10 +92,17 @@ async def get_orchestrator_status():
         active = [
             i for i in investigations if i.get("status") in ("assigned", "executing")
         ]
-        queued = [i for i in investigations if i.get("status") == "queued"]
         completed = [i for i in investigations if i.get("status") == "completed"]
         failed = [i for i in investigations if i.get("status") == "failed"]
         review = [i for i in investigations if i.get("status") == "review_submitted"]
+
+        # Waiting room is intake_triggers. Count it here like GET /intake;
+        # swallowing a miss as 0 would look like an empty queue.
+        from core.storage.connection import get_db_manager
+        from core.storage.models import IntakeTrigger
+
+        with get_db_manager().session_scope() as session:
+            queued = session.query(IntakeTrigger).filter_by(state="queued").count()
 
         max_agents = 3
         try:
@@ -112,7 +119,7 @@ async def get_orchestrator_status():
             "enabled": enabled,
             "active_agents": len(active),
             "max_concurrent_agents": max_agents,
-            "queued": len(queued),
+            "queued": queued,
             "completed": len(completed),
             "failed": len(failed),
             "pending_review": len(review),
