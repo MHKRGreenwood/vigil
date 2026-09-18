@@ -86,22 +86,66 @@ class DetectionRulesService:
         self._load_config()
 
     def _load_config(self):
-        """Load sources from config file, or seed defaults on first run."""
+        """Load sources from config, rescanning them against disk; seed on first run."""
         if self.config_path.exists():
             try:
                 with open(self.config_path, "r") as f:
                     data = json.load(f)
-                    self.sources = data.get("sources", [])
-                    logger.info(
-                        f"Loaded {len(self.sources)} detection rule sources from config"
-                    )
-                    return
+                self.sources = data.get("sources", [])
+                logger.info(
+                    f"Loaded {len(self.sources)} detection rule sources from config"
+                )
             except Exception as e:
                 logger.error(f"Error loading detection sources config: {e}")
+            else:
+                # Outside the try: a rescan failure must not fall through to
+                # _seed_defaults, which would overwrite the user's sources.
+                # The saved status is a snapshot from whenever the file was last
+                # written; repos cloned since then (#968) only show up if we look.
+                self.rescan_sources()
+                return
 
         # First run or corrupt config -- seed defaults
         logger.info("No detection sources config found, seeding defaults")
         self._seed_defaults()
+
+    def reload(self):
+        """Re-read the config file and rescan every source against disk."""
+        self._load_config()
+
+    def rescan_sources(self):
+        """Re-derive status and rule_count for every source from what is on disk."""
+        changed = False
+        for source in self.sources:
+            local_path = source.get("local_path")
+            if not local_path:
+                continue
+            local_dir = Path(local_path)
+            if local_dir.exists():
+                status = "ready"
+                count = self._count_rules(
+                    local_dir,
+                    source.get("format", "auto"),
+                    source.get("subdirectory", ""),
+                )
+            else:
+                # A git source can still be cloned; a local path that vanished cannot.
+                status = "not_cloned" if source.get("type") == "git" else "error"
+                count = 0
+            if status == source.get("status") and count == source.get("rule_count"):
+                continue
+            logger.info(
+                f"Rescanned {source.get('name')}: {source.get('status')} -> {status}"
+                f" ({count} rules)"
+            )
+            if status == "ready" and source.get("status") != "ready":
+                source["last_updated"] = datetime.now().isoformat()
+            source["status"], source["rule_count"] = status, count
+            changed = True
+        # Only write when something moved: this runs on every construction, and
+        # the service is built in more than one process.
+        if changed:
+            self._save_config()
 
     def _seed_defaults(self):
         """Seed default sources based on existing repos on disk."""
