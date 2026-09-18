@@ -251,8 +251,23 @@ def _indicator_lookup(args: Args) -> Any:
     ]
 
 
+# Recent feed rows through the coverage check (#905). Proposes; never hunts.
+def _propose_feed_hunts(args: Args) -> Any:
+    from core.threat_intel.threat_feed_service import (
+        RECENT_INDICATOR_LIMIT,
+        propose_hunts_from_recent_indicators,
+    )
+
+    try:
+        limit = int(args.get("limit", RECENT_INDICATOR_LIMIT))
+    except (TypeError, ValueError):
+        return {"error": f"limit must be an integer, got {args.get('limit')!r}"}
+    return propose_hunts_from_recent_indicators(limit=limit)
+
+
 _INTEL_TOOLS: Dict[str, Callable[[Args], Any]] = {
     "lookup_indicators": _indicator_lookup,
+    "propose_feed_hunts": _propose_feed_hunts,
 }
 
 
