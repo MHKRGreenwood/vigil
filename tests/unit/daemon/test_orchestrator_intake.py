@@ -14,7 +14,11 @@ import pytest
 
 from core.time import utcnow
 from services.daemon.config import OrchestratorConfig
-from services.daemon.orchestrator import Orchestrator, lift_ai_enrichment
+from services.daemon.orchestrator import (
+    Orchestrator,
+    _Overlap,
+    lift_ai_enrichment,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -46,7 +50,9 @@ def _orchestrator(**extra) -> Orchestrator:
     orch._create_manual_investigation = AsyncMock()
     orch._decide_trigger = MagicMock()
     orch._data_service = MagicMock()
-    orch._attach_finding_to_overlap = MagicMock(return_value="case-1")
+    orch._attach_to_overlapping_case = MagicMock(
+        return_value=(_Overlap.MERGED, "case-1")
+    )
     orch._in_flight = MagicMock(return_value=0)
     orch._queued_intake_depth = MagicMock(return_value=0)
     orch._intake_surge_active = False
@@ -55,12 +61,12 @@ def _orchestrator(**extra) -> Orchestrator:
     return orch
 
 
-def test_merged_into_is_wide_enough_for_an_investigation_id():
-    from core.storage.models import IntakeTrigger, Investigation
+def test_merged_into_is_as_wide_as_a_case():
+    from core.storage.models import Case, IntakeTrigger
 
     assert (
         IntakeTrigger.__table__.c.merged_into.type.length
-        == Investigation.__table__.c.investigation_id.type.length
+        >= Case.__table__.c.case_id.type.length
     )
 
 
@@ -152,7 +158,7 @@ async def test_overlap_ends_merged_with_the_case_it_joined():
 
     await orch._create_investigation_for_finding(HIGH, None, trigger_id=9)
 
-    orch._attach_finding_to_overlap.assert_called_once_with("f-high", ["inv-1"])
+    orch._attach_to_overlapping_case.assert_called_once_with("f-high", ["inv-1"])
     orch._decide_trigger.assert_called_once_with(
         9, state="merged", reason="overlaps_open_work", merged_into="case-1"
     )
@@ -167,7 +173,7 @@ async def test_a_medium_finding_that_overlaps_merges_instead_of_shedding():
 
     await orch._create_investigation_for_finding(MEDIUM, None, trigger_id=8)
 
-    orch._attach_finding_to_overlap.assert_called_once_with("f-med", ["inv-1"])
+    orch._attach_to_overlapping_case.assert_called_once_with("f-med", ["inv-1"])
     orch._decide_trigger.assert_called_once_with(
         8, state="merged", reason="overlaps_open_work", merged_into="case-1"
     )
@@ -178,11 +184,11 @@ async def test_a_medium_finding_that_overlaps_merges_instead_of_shedding():
 async def test_failed_attach_leaves_row_queued():
     orch = _orchestrator()
     orch.shared_intel.check_overlap.return_value = ["inv-1"]
-    orch._attach_finding_to_overlap = MagicMock(return_value=None)
+    orch._attach_to_overlapping_case = MagicMock(return_value=(_Overlap.HOLD, None))
 
     await orch._create_investigation_for_finding(HIGH, None, trigger_id=9)
 
-    orch._attach_finding_to_overlap.assert_called_once_with("f-high", ["inv-1"])
+    orch._attach_to_overlapping_case.assert_called_once_with("f-high", ["inv-1"])
     orch._decide_trigger.assert_not_called()
     orch._create_investigation.assert_not_awaited()
 
@@ -191,7 +197,7 @@ async def test_failed_attach_leaves_row_queued():
 async def test_failed_attach_does_not_count_dedup():
     orch = _orchestrator()
     orch.shared_intel.check_overlap.return_value = ["inv-1"]
-    orch._attach_finding_to_overlap = MagicMock(return_value=None)
+    orch._attach_to_overlapping_case = MagicMock(return_value=(_Overlap.HOLD, None))
 
     await orch._create_investigation_for_finding(HIGH, None, trigger_id=9)
 
@@ -202,13 +208,42 @@ async def test_failed_attach_does_not_count_dedup():
 async def test_failed_attach_on_resolve_is_not_launchable():
     orch = _orchestrator()
     orch.shared_intel.check_overlap.return_value = ["inv-1"]
-    orch._attach_finding_to_overlap = MagicMock(return_value=None)
+    orch._attach_to_overlapping_case = MagicMock(return_value=(_Overlap.HOLD, None))
     orch._hydrate_detection_finding = MagicMock(return_value=HIGH)
     row = {"id": 9, "kind": "detection", "finding_id": "f-high"}
 
     kept = orch._resolve_intake_row(row, utcnow())
 
     assert kept is None
+    orch._decide_trigger.assert_not_called()
+    assert orch.stats["dedup_prevented"] == 0
+
+
+@pytest.mark.asyncio
+async def test_overlap_with_caseless_run_is_not_a_merge():
+    orch = _orchestrator()
+    orch.shared_intel.check_overlap.return_value = ["inv-hunt"]
+    orch._attach_to_overlapping_case = MagicMock(return_value=(_Overlap.LAUNCH, None))
+
+    await orch._create_investigation_for_finding(HIGH, None, trigger_id=9)
+
+    orch._attach_to_overlapping_case.assert_called_once_with("f-high", ["inv-hunt"])
+    orch._decide_trigger.assert_not_called()
+    orch._create_investigation.assert_awaited_once()
+    assert orch.stats["dedup_prevented"] == 0
+
+
+@pytest.mark.asyncio
+async def test_caseless_overlap_on_resolve_stays_launchable():
+    orch = _orchestrator()
+    orch.shared_intel.check_overlap.return_value = ["inv-hunt"]
+    orch._attach_to_overlapping_case = MagicMock(return_value=(_Overlap.LAUNCH, None))
+    orch._hydrate_detection_finding = MagicMock(return_value=HIGH)
+    row = {"id": 9, "kind": "detection", "finding_id": "f-high"}
+
+    kept = orch._resolve_intake_row(row, utcnow())
+
+    assert kept is row
     orch._decide_trigger.assert_not_called()
     assert orch.stats["dedup_prevented"] == 0
 
@@ -465,7 +500,7 @@ async def test_scan_row_merges_into_live_case():
     kept = orch._resolve_intake_row(row, utcnow())
 
     assert kept is None
-    orch._attach_finding_to_overlap.assert_called_once_with("f-high", ["inv-1"])
+    orch._attach_to_overlapping_case.assert_called_once_with("f-high", ["inv-1"])
     orch._decide_trigger.assert_called_once_with(
         12, state="merged", reason="overlaps_open_work", merged_into="case-1"
     )
