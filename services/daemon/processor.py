@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.time import utcnow
-from services.daemon.config import ProcessingConfig
+from services.daemon.config import ProcessingConfig, ResponseConfig
 from services.daemon.probes import PROBE_DATA_SOURCE
 
 logger = logging.getLogger(__name__)
@@ -33,8 +33,15 @@ _AI_ANALYSIS_KEYS = (
 class FindingProcessor:
     """Processes findings through AI triage and enrichment."""
 
-    def __init__(self, config: ProcessingConfig):
+    def __init__(
+        self,
+        config: ProcessingConfig,
+        response_config: Optional[ResponseConfig] = None,
+    ):
         self.config = config
+        # The queue-for-response line is the band's review threshold, so the
+        # processor reads the same ResponseConfig the responder does (#916).
+        self.response_config = response_config or ResponseConfig.from_settings()
         self.input_queue: asyncio.Queue = asyncio.Queue()
         self._response_queue: Optional[asyncio.Queue] = None
 
@@ -840,7 +847,7 @@ REASONING: [Brief explanation]
         should_respond = (
             severity in ["critical", "high"]
             or recommended_action in ["isolate", "block"]
-            or confidence >= 0.85
+            or confidence >= self.response_config.review_threshold
         )
 
         if should_respond and self._response_queue:
