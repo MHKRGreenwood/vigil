@@ -5810,11 +5810,10 @@ export interface paths {
         post?: never;
         /**
          * Delete Sla Policy
-         * @description Delete an SLA policy.
+         * @description Delete an SLA policy that no case references.
          *
          *     Args:
          *         policy_id: The policy ID
-         *         force: Force delete even if policy is in use
          *
          *     Returns:
          *         Success message
@@ -20239,9 +20238,7 @@ export interface operations {
     };
     "delete_api_sla-policies_policy_id": {
         parameters: {
-            query?: {
-                force?: boolean;
-            };
+            query?: never;
             header?: {
                 authorization?: string | null;
             };
