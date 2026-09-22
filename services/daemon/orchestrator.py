@@ -79,7 +79,6 @@ except Exception:
     ) = None  # type: ignore[assignment]
 from core.agents.projections import read_projection, run_id_for
 from core.agents.queue import RUN_KINDS, build_start_job, enqueue_run
-from core.integrations.mcp.client import process_mcp_client
 from core.memory.entity_keys import finding_entity_keys, normalise_keys
 from core.response.approval_service import ApprovalService
 from core.response.checkpoints import raise_for_checkpoint
@@ -111,6 +110,22 @@ def _count_queued_intake_rows() -> int:
 
     with get_db_manager().session_scope() as session:
         return session.query(IntakeTrigger).filter_by(state="queued").count()
+
+
+# related_to: the type the case screen labels and an analyst's link defaults to.
+def _link_cases(case_a: str, case_b: str, notes: str) -> None:
+    from core.cases.case_records_service import link_cases
+    from core.storage.connection import get_db_manager
+
+    with get_db_manager().session_scope() as session:
+        link_cases(
+            session,
+            case_a,
+            case_b,
+            relationship_type="related_to",
+            created_by=ORCHESTRATOR_ACTOR,
+            notes=notes,
+        )
 
 
 def lift_ai_enrichment(finding: Dict) -> Dict:
@@ -419,16 +434,12 @@ class Orchestrator:
         self,
         config: OrchestratorConfig,
         approvals: Optional[ApprovalService] = None,
-        mcp_client=None,
         workflows: Optional[WorkflowsService] = None,
     ):
         self.config = config
         self._enabled = config.enabled
         self._shutdown_event: Optional[asyncio.Event] = None
         self._approvals = approvals or ApprovalService()
-        self._mcp_client = (
-            mcp_client if mcp_client is not None else process_mcp_client()
-        )
         # Read for the run_kind a definition declares; the file cache needs no DB.
         self._workflows = workflows or WorkflowsService()
 
@@ -1823,20 +1834,14 @@ class Orchestrator:
             case_b = inv_b.get("case_id") if inv_b else None
 
             if case_a and case_b and case_a != case_b:
+                notes = f"Shared IOCs: {', '.join(shared_keys[:10])}"
                 try:
-                    client = self._mcp_client
-                    if client:
-                        await client.call_tool(
-                            "link_related_cases",
-                            {
-                                "case_id": case_a,
-                                "related_case_id": case_b,
-                                "relationship": "shared_iocs",
-                            },
-                        )
-                        logger.info(f"Linked cases {case_a} <-> {case_b}")
-                except Exception as e:
-                    logger.debug(f"Failed to link cases: {e}")
+                    await asyncio.to_thread(_link_cases, case_a, case_b, notes)
+                    logger.info(f"Linked cases {case_a} <-> {case_b}")
+                except Exception:
+                    logger.warning(
+                        f"Failed to link cases {case_a} <-> {case_b}", exc_info=True
+                    )
 
             cross_note = (
                 f"\n\n## Cross-Investigation Note\n"
