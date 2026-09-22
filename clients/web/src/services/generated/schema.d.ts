@@ -7299,7 +7299,7 @@ export interface components {
          */
         CaseCommentSchema: {
             /** Attachment Ids */
-            attachment_ids?: string[];
+            attachment_ids?: number[];
             /** Author */
             author?: string | null;
             /** Case Id */
