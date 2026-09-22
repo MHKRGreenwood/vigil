@@ -143,7 +143,7 @@ def test_another_token_is_not_the_development_credential():
 def test_the_development_credential_resolves_to_the_developer():
     """The bypass-on path, which every other test here returns before reaching.
 
-    It is the only caller of ``_get_dev_user`` outside the auth middleware, and
+    It is the only caller of ``_get_dev_user`` outside ``core.auth``, and
     it imports it inside the function -- so a move of that function lands as an
     ImportError the first time somebody presents this token, on a machine, not
     here. Taking the path is what turns that into a red test.
@@ -154,7 +154,7 @@ def test_the_development_credential_resolves_to_the_developer():
     with patch("core.config.get_settings") as settings:
         settings.return_value.dev_mode = True
         with patch(
-            "services.api.middleware.auth._get_dev_user", return_value=a_developer
+            "core.auth.current_user._get_dev_user", return_value=a_developer
         ):
             assert _dev_mode_user(DEV_MODE_TOKEN) is a_developer
 

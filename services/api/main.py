@@ -23,11 +23,14 @@ from core.config import get_settings, validate_settings_or_exit
 
 validate_settings_or_exit()
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core.platform.monitoring import get_metrics_response, init_sentry
 from core.version import __version__
@@ -132,11 +135,21 @@ async def lifespan(app: FastAPI):
             await _shutdown(app)
 
 
-# Create FastAPI app
+# `version` is the version of the API this document describes, not the version
+# of the build serving it. Those are different things: the build moves every
+# release, and a document whose version renumbers itself every release is the
+# opposite of what a version in the path is for. The frozen surface is
+# `/api/v1/**`, so this says 1 and stays at 1 until there is a v2. The build
+# version is still reported, by the health and root endpoints below.
 app = FastAPI(
     title="Vigil SOC API",
-    description="REST API for Vigil SOC Application",
-    version=__version__,
+    description=(
+        "REST API for Vigil SOC Application. The frozen contract is "
+        "`/api/v1/**` (excluding operations marked `x-vigil-beta`); paths "
+        "under a bare `/api` are console wiring and carry no stability "
+        "promise."
+    ),
+    version="1",
     lifespan=lifespan,
 )
 
@@ -750,6 +763,46 @@ async def health_check():
         return payload
 
 
+# Everything this process serves itself. A 404 under one of these is a miss,
+# not a client-side route: the SPA's router knows nothing about them, so
+# answering with the app shell hands a caller HTML where it asked for an API
+# result -- or, for a bundle under /static, HTML the browser then refuses to
+# execute as a module.
+_SERVED_BY_THE_BACKEND = (
+    "/api",
+    "/internal",
+    "/mcp",
+    "/static",
+    "/assets",
+    "/metrics",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+)
+
+
+def serves_the_app_shell(path: str, method: str, context_path: str = "") -> bool:
+    """Whether a 404 at ``path`` is a client-side route rather than a miss.
+
+    The SPA owns every address the API does not. Reading that as a route --
+    ``@app.get("/{full_path:path}")`` -- reads it as *every* address, including
+    the API's own, and the route then stands in front of the routing it was
+    meant to sit behind: a path that differs from a real route only by a
+    trailing slash matched this instead, so Starlette never got to redirect it,
+    and a POST matched it by path and not by method, so the answer was 405.
+    Asking the question after routing has failed leaves all of that intact.
+
+    A path this process serves itself is never the app shell. It reached a 404
+    because nothing claims it, and that is the answer it gets.
+    """
+    if method not in ("GET", "HEAD"):
+        return False
+    return not any(
+        path == f"{context_path}{prefix}" or path.startswith(f"{context_path}{prefix}/")
+        for prefix in _SERVED_BY_THE_BACKEND
+    )
+
+
 # Vigil's own MCP server, given an address. Mounted before the SPA catch-all so
 # /mcp reaches the server rather than index.html, and behind a gate that decides
 # whether the surface is open at all and, if it is, whose request this is.
@@ -800,8 +853,6 @@ if frontend_build_dir.exists() and assets_dir.exists():
         logger.warning(f"Failed to mount frontend assets: {e}")
 
 if frontend_build_dir.exists() and (frontend_build_dir / "index.html").exists():
-    from fastapi.responses import HTMLResponse
-
     # index.html is served with the active context path injected as a
     # <meta name="vigil-base-path"> tag so the SPA (see frontend
     # src/config/basePath.ts) can prefix its router basename and API calls at
@@ -848,13 +899,17 @@ if frontend_build_dir.exists() and (frontend_build_dir / "index.html").exists():
     # is only registered when a frontend build happens to be present. Leaving it
     # in makes the generated types (scripts/generate_frontend_types.py) depend on
     # whether the developer regenerating them had run `npm run build`.
-    @app.get(f"{_CONTEXT_PATH}/{{full_path:path}}", include_in_schema=False)
-    async def serve_react_app(full_path: str):
-        """Serve React app for all non-API routes."""
-        # Don't interfere with API routes
-        if full_path.startswith("api/"):
-            return {"error": "Not found"}, 404
-        return HTMLResponse(_get_index_html())
+    # A handler, not a route. See ``serves_the_app_shell``: a catch-all route
+    # matches before the router can redirect a trailing slash or report a wrong
+    # method, so the SPA fallback silently became the answer to questions about
+    # the API. This runs only once routing has already failed.
+    @app.exception_handler(StarletteHTTPException)
+    async def app_shell_or_error(request: Request, exc: StarletteHTTPException):
+        if exc.status_code == 404 and serves_the_app_shell(
+            request.url.path, request.method, _CONTEXT_PATH
+        ):
+            return HTMLResponse(_get_index_html())
+        return await http_exception_handler(request, exc)
 
 
 if __name__ == "__main__":

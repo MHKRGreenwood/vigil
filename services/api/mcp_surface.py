@@ -200,8 +200,8 @@ def _dev_mode_user(token: str):
         )
         return None
 
+    from core.auth.current_user import _get_dev_user
     from core.storage.unit_of_work import unit_of_work
-    from services.api.middleware.auth import _get_dev_user
 
     logger.warning(
         "MCP request authenticated by the development credential, not a minted one."
