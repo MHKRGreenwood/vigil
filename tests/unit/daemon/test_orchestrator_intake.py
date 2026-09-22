@@ -388,6 +388,33 @@ async def test_processor_inserts_a_detection_row(monkeypatch):
     assert processor.stats["queued_for_investigation"] == 1
 
 
+@pytest.mark.asyncio
+async def test_a_second_offer_of_the_same_finding_does_not_count(monkeypatch):
+    from services.daemon.config import ProcessingConfig
+    from services.daemon.processor import FindingProcessor
+
+    captured = []
+
+    def insert(**kwargs):
+        captured.append(kwargs)
+        return 1 if len(captured) == 1 else None
+
+    monkeypatch.setattr("services.daemon.orchestrator.insert_intake_trigger", insert)
+    processor = FindingProcessor(ProcessingConfig())
+    finding = {
+        "finding_id": "f-dup",
+        "severity": "high",
+        "enrichment": {"threat_indicators": {"ip:203.0.113.7": {}}},
+    }
+
+    await processor._evaluate_for_response(finding)
+    await processor._evaluate_for_response(finding)
+
+    assert len(captured) == 2
+    assert all(call["kind"] == "detection" for call in captured)
+    assert processor.stats["queued_for_investigation"] == 1
+
+
 def _scan_session(investigations, findings):
     class Session:
         def query(self, model):

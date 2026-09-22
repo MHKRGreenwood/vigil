@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from core.memory.entity_keys import entity_key, text_entity_keys
@@ -224,16 +224,18 @@ def parse_report(text: str) -> Dict[str, List[str]]:
 def _parse_dt(value: Any) -> Optional[datetime]:
     if not value:
         return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=None)
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
-                tzinfo=None
-            )
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-    return None
+    if not isinstance(value, datetime):
+        return None
+    # Converted before it is made naive: the columns hold UTC, and dropping an
+    # offset unconverted moves valid_until by that many hours.
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _confidence_to_level(confidence: Optional[Any]) -> Optional[str]:
@@ -382,8 +384,10 @@ def upsert_indicators(indicators: List[NormalizedIndicator]) -> Dict[str, int]:
                         existing.threat_level = ind.threat_level
                     if ind.labels:
                         existing.labels = ind.labels
-                    if ind.valid_until:
-                        existing.valid_until = ind.valid_until
+                    # Unconditional: a re-published indicator with no
+                    # valid_until no longer expires, and keeping the old
+                    # past date would hide a hit the feed still reports.
+                    existing.valid_until = ind.valid_until
                     if ind.raw_stix:
                         existing.raw_stix = ind.raw_stix
                     updated += 1
@@ -398,10 +402,20 @@ def upsert_indicators(indicators: List[NormalizedIndicator]) -> Dict[str, int]:
     return {"inserted": inserted, "updated": updated, "skipped": skipped}
 
 
+def _unexpired_clause(now: datetime):
+    """Live rows: no expiry, or a window that has not closed."""
+    from core.storage.models import ThreatIndicator
+
+    return (ThreatIndicator.valid_until.is_(None)) | (ThreatIndicator.valid_until > now)
+
+
 def lookup_indicators(
     indicator_type: str, values: List[str]
 ) -> Dict[str, Dict[str, Any]]:
-    """Look up a batch of indicator values; return matches keyed by value."""
+    """Look up a batch of currently-valid indicator values; keyed by value.
+
+    Expired rows (``valid_until`` in the past) are omitted. A NULL expiry is live.
+    """
     if not values:
         return {}
     try:
@@ -413,11 +427,13 @@ def lookup_indicators(
         return {}
     db = get_db_manager()
     out: Dict[str, Dict[str, Any]] = {}
+    now = utcnow()
     with db.session_scope() as session:
         rows = (
             session.query(ThreatIndicator)
             .filter(ThreatIndicator.indicator_type == indicator_type)
             .filter(ThreatIndicator.indicator_value.in_(values))
+            .filter(_unexpired_clause(now))
             .all()
         )
         for row in rows:
@@ -444,9 +460,11 @@ def _recent_indicators(limit: int) -> List[Dict[str, Any]]:
         logger.debug("ThreatIndicator read unavailable: %s", e)
         return []
     db = get_db_manager()
+    now = utcnow()
     with db.session_scope() as session:
         rows = (
             session.query(ThreatIndicator)
+            .filter(_unexpired_clause(now))
             .order_by(ThreatIndicator.last_seen.desc(), ThreatIndicator.id.desc())
             .limit(limit)
             .all()

@@ -871,12 +871,13 @@ REASONING: [Brief explanation]
         if should_respond or feed_hit:
             from services.daemon.orchestrator import insert_intake_trigger
 
-            insert_intake_trigger(
+            trigger_id = insert_intake_trigger(
                 kind="detection",
                 finding_id=finding.get("finding_id"),
                 priority=severity or "medium",
             )
-            self.stats["queued_for_investigation"] += 1
-            logger.info(
-                f"Finding {finding.get('finding_id')} queued for autonomous investigation"
-            )
+            if trigger_id is not None:
+                self.stats["queued_for_investigation"] += 1
+                logger.info(
+                    f"Finding {finding.get('finding_id')} queued for autonomous investigation"
+                )
