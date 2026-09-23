@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import func
+
 from core.agents.builtins import ORCHESTRATION_DECISION_ID, ORCHESTRATOR_ACTOR
 from core.config import get_settings
 from core.time import utcnow
@@ -447,7 +449,7 @@ class Orchestrator:
         self.shared_intel = SharedIntelligence()
 
         self._data_service = None
-        self._hourly_costs: List[Dict] = []
+        self._hourly_paused = False
 
         self.stats = {
             "investigations_created": 0,
@@ -597,10 +599,13 @@ class Orchestrator:
                 promote_fraction=self.config.intake_ttl_promote_fraction,
             )
         )
-        for row in launchable:
-            if self._in_flight() >= self.config.max_concurrent_agents:
-                break
-            await self._process_intake_row(row, shutdown_event)
+        # Rows stay queued while the hour is at the cap; they launch once old
+        # spend rolls out of the window.
+        if not self._hourly_budget_exhausted():
+            for row in launchable:
+                if self._in_flight() >= self.config.max_concurrent_agents:
+                    break
+                await self._process_intake_row(row, shutdown_event)
 
         depth = self._queued_intake_depth()
         if depth is not None:
@@ -996,7 +1001,7 @@ class Orchestrator:
 
     async def _pickup_assigned_investigations(self, shutdown_event: asyncio.Event):
         """Re-enqueue assigned investigations after a restart."""
-        if self.config.dry_run:
+        if self.config.dry_run or self._hourly_budget_exhausted():
             return
 
         for inv in self._get_investigations_by_status("assigned"):
@@ -1118,8 +1123,6 @@ class Orchestrator:
                         self._update_investigation_status(
                             inv_id, "failed", "Cost budget exceeded"
                         )
-
-                self._track_hourly_cost()
 
                 if not hasattr(self, "_supervision_tick"):
                     self._supervision_tick = 0
@@ -1398,18 +1401,75 @@ class Orchestrator:
             parameters={"investigation_id": inv_id},
         )
 
-    def _track_hourly_cost(self):
-        """Track rolling hourly cost for budget enforcement."""
-        now = utcnow()
-        cutoff = now - timedelta(hours=1)
-        self._hourly_costs = [c for c in self._hourly_costs if c["ts"] > cutoff]
-        hourly_total = sum(c["cost"] for c in self._hourly_costs)
+    def _hourly_cost(self) -> Optional[float]:
+        """Recorded cost of investigations active in the last hour; None if unreadable.
 
-        if hourly_total >= self.config.max_total_hourly_cost:
-            logger.warning(
-                f"Hourly cost ${hourly_total:.2f} exceeds limit ${self.config.max_total_hourly_cost:.2f}, pausing intake"
-            )
-            self._enabled = False
+        Keyed on last_activity_at, which every reconcile of an in-flight run
+        stamps, so in-flight runs count in full and a finished run drops out an
+        hour after its last update. An unpriced run is stored as 0.0 (#985).
+        """
+        try:
+            from core.storage.connection import get_db_manager
+            from core.storage.models import Investigation
+
+            cutoff = utcnow() - timedelta(hours=1)
+            with get_db_manager().session_scope() as session:
+                total = (
+                    session.query(func.sum(Investigation.cost_usd))
+                    .filter(Investigation.last_activity_at >= cutoff)
+                    .scalar()
+                )
+            return float(total or 0.0)
+        except Exception as e:
+            logger.error(f"Failed to read hourly cost: {e}")
+            return None
+
+    def _hourly_cost_limit(self) -> float:
+        """The cap as saved in Settings, falling back to startup config.
+
+        Read live so the daemon's gate and the API's status payload (a separate
+        process on default config) agree, and a saved change applies at once.
+        """
+        try:
+            from core.storage.connection import get_db_manager
+            from core.storage.models import SystemConfig
+
+            with get_db_manager().session_scope() as session:
+                cfg = (
+                    session.query(SystemConfig)
+                    .filter_by(key="orchestrator.settings")
+                    .first()
+                )
+                if cfg and isinstance(cfg.value, dict):
+                    saved = cfg.value.get("max_total_hourly_cost")
+                    if saved is not None:
+                        return float(saved)
+        except Exception as e:
+            logger.debug(f"Hourly cost limit read failed, using config: {e}")
+        return self.config.max_total_hourly_cost
+
+    def _hourly_budget_exhausted(self) -> bool:
+        """Gate intake on the rolling hour; logs once per pause/resume transition.
+
+        Not a write to _enabled: _sync_enabled_from_db would undo it within 5s.
+        """
+        spent = self._hourly_cost()
+        if spent is None:
+            # Unknown spend keeps the last decision rather than releasing a pause.
+            return getattr(self, "_hourly_paused", False)
+        limit = self._hourly_cost_limit()
+        paused = spent >= limit
+        if paused != getattr(self, "_hourly_paused", False):
+            self._hourly_paused = paused
+            if paused:
+                logger.warning(
+                    f"Hourly cost ${spent:.4f} reached limit ${limit:.4f}, pausing intake"
+                )
+            else:
+                logger.info(
+                    f"Hourly cost ${spent:.4f} below limit ${limit:.4f}, resuming intake"
+                )
+        return paused
 
     # -------------------------------------------------------------------------
     # Review Loop
@@ -2185,14 +2245,12 @@ class Orchestrator:
             for i in all_inv
             if i.get("status") in ("assigned", "executing")
         )
-        hourly = sum(c["cost"] for c in self._hourly_costs)
+        hourly = self._hourly_cost() or 0.0
         return {
             "total_cost_usd": round(total, 4),
             "active_cost_usd": round(active_cost, 4),
             "hourly_cost_usd": round(hourly, 4),
-            "hourly_budget_remaining": round(
-                self.config.max_total_hourly_cost - hourly, 4
-            ),
+            "hourly_budget_remaining": round(self._hourly_cost_limit() - hourly, 4),
             "per_investigation_limit": self.config.max_cost_per_investigation,
         }
 
@@ -2226,7 +2284,6 @@ class Orchestrator:
             logger.warning(f"Workdir cleanup failed after purge: {e}")
 
         self.shared_intel = SharedIntelligence()
-        self._hourly_costs = []
 
         logger.warning(
             f"Purged {deleted} investigations and reset workdir tree at {self.workdir.base_dir}"
