@@ -1,4 +1,9 @@
 # Vigil
+Vigil 1.0 is around the corner!
+
+We believe Vigil 1.0 will be the first human on the loop, as opposed to human in the loop, AI SOC solution of which we are aware.
+Please join upcoming office hours if you would like to learn more, and see a preview of this novel approach to safe, trusted, scalable agentic defense.
+
 
 Vigil is the leading open source AI SOC: an agentic SOC with 13 specialized AI agents, 30+ MCP integrations, and 7,200+ community detection rules, released under Apache 2.0. Your playbooks are plain-text files, your agent logic is readable Python, and your integrations use an open standard ([MCP](https://modelcontextprotocol.io/)). Every proprietary AI SOC on the market is a black box you rent. Vigil is a capability you own.
 
