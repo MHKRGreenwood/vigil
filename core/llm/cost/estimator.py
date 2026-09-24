@@ -16,7 +16,7 @@ Token counting strategy by provider:
   - **OpenAI**: uses ``tiktoken`` if available (encoder lookup by model
     name), else falls back to a 4-chars-per-token heuristic. The heuristic
     is good enough for budget gating but not for billing — callers see
-    ``pricing_source="heuristic"`` and can badge the estimate accordingly.
+    ``token_count_method="char_heuristic"`` and can badge the estimate.
 
   - **Everything else** (Vertex, Gemini, Bedrock, Azure, Ollama, ...): the
     char heuristic, priced at the registry's rates for that provider. Ollama
@@ -57,7 +57,7 @@ class CostEstimate:
     output_tokens_max: int
     low_usd: float
     high_usd: float
-    pricing_source: str  # "exact" | "heuristic" | "zero" | "unknown"
+    pricing_source: str  # "exact" | "zero" | "unknown"
     token_count_method: str  # "anthropic_count_tokens" | "tiktoken" | "char_heuristic"
 
     def to_dict(self) -> Dict[str, Any]:

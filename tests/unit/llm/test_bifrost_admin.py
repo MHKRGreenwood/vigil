@@ -506,6 +506,143 @@ def test_sync_all_unions_across_same_type_providers(monkeypatch):
     _reset_registry()
 
 
+def _priced(mid, inp, out):
+    from core.llm.providers.discovery import ModelMeta
+
+    return ModelMeta(
+        id=mid, display_name=mid, input_cost_per_token=inp, output_cost_per_token=out
+    )
+
+
+def test_catalogue_reads_rates_and_prefers_an_operator_override(monkeypatch):
+    """Bifrost v2.2.1 reports an override beside the base rate, not in place of it."""
+    import asyncio
+
+    import httpx
+
+    from core.llm.bifrost import admin as ba
+
+    entries = [
+        {
+            "name": "claude-opus-4-7",
+            "max_output_tokens": 128000,
+            "input_cost_per_token": 5e-06,
+            "output_cost_per_token": 2.5e-05,
+            "cache_read_input_token_cost": 5e-07,
+            "cache_creation_input_token_cost": 6.25e-06,
+            "overridden_pricing": {
+                "input_cost_per_token": 1e-06,
+                "output_cost_per_token": 2e-06,
+            },
+        },
+        {"name": "no-price", "max_output_tokens": 1, "input_cost_per_token": None},
+    ]
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"models": entries})
+    )
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        ba.httpx, "AsyncClient", lambda **kw: real_client(transport=transport, **kw)
+    )
+
+    opus, unpriced = asyncio.run(ba.fetch_catalogue_models("anthropic"))
+    assert (opus.input_cost_per_token, opus.output_cost_per_token) == (1e-06, 2e-06)
+    assert opus.cache_read_cost_per_token == 5e-07
+    assert opus.cache_write_cost_per_token == 6.25e-06
+    assert unpriced.input_cost_per_token is None
+
+
+def test_sync_all_prices_from_the_datasheet_without_changing_the_list(monkeypatch):
+    """Discovery answered, so it alone decides the list; the datasheet is read
+    anyway, for every type (ollama included), and supplies only the rates."""
+    import asyncio
+
+    from core.llm.bifrost import admin as ba
+    from core.llm.providers import registry as model_registry
+
+    _reset_registry()
+    _patch_db(
+        monkeypatch,
+        [_FakeProviderRow("ant", "anthropic"), _FakeProviderRow("oll", "ollama")],
+    )
+
+    async def fake_fetch_row(row_dict, discovery, key=None):
+        if row_dict["provider_type"] == "ollama":
+            return [_M("llama3.1:8b")]
+        return [_M("claude-opus-4-7")]
+
+    sheets = {
+        "anthropic": [
+            _priced("claude-opus-4-7", 5e-6, 2.5e-5),
+            _priced("claude-not-discovered", 1e-6, 2e-6),
+        ],
+        "ollama": [_priced("llama3.1:8b", 1e-7, 2e-7)],
+    }
+
+    async def fake_catalogue(provider_type):
+        return sheets.get(provider_type)
+
+    monkeypatch.setattr(ba, "_fetch_meta_for_row", fake_fetch_row)
+    monkeypatch.setattr(ba, "fetch_catalogue_models", fake_catalogue)
+    monkeypatch.setattr(ba, "sync_provider_models", lambda *a, **k: True)
+    monkeypatch.setenv("ANTHROPIC_EXTRA_MODELS", "")
+
+    asyncio.run(ba.sync_all_provider_models())
+
+    assert model_registry._MODEL_LIST_CACHE["ant"] == ["claude-opus-4-7"]
+    assert model_registry._MODEL_LIST_CACHE["oll"] == ["llama3.1:8b"]
+    assert {"ant", "oll"} <= model_registry._LIVE_CATALOGUES
+    registry = model_registry.get_registry()
+    assert registry.get_cost_rates("claude-opus-4-7", "anthropic") == (5e-6, 2.5e-5)
+    assert registry.get_pricing_source("llama3.1:8b", "ollama") == "exact"
+    _reset_registry()
+
+
+def test_refresh_gateway_rates_fills_rates_without_the_full_sync(monkeypatch):
+    """The worker and daemon price calls too, but must never write to Bifrost."""
+    import asyncio
+
+    from core.llm.bifrost import admin as ba
+    from core.llm.providers import registry as model_registry
+
+    _reset_registry()
+
+    class _Query:
+        def filter(self, *_):
+            return self
+
+        def distinct(self):
+            return iter([("anthropic",), ("vertex",)])
+
+    class _Scope:
+        def __enter__(self):
+            return type("S", (), {"query": lambda self, *_: _Query()})()
+
+        def __exit__(self, *exc):
+            return False
+
+    fake_db = type("DB", (), {"_engine": object(), "session_scope": lambda s: _Scope()})
+    monkeypatch.setattr("core.storage.connection.get_db_manager", lambda: fake_db())
+
+    async def fake_catalogue(provider_type):
+        return [_priced(f"{provider_type}-m", 1e-6, 2e-6)]
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("the rates refresh must not write to Bifrost")
+
+    monkeypatch.setattr(ba, "fetch_catalogue_models", fake_catalogue)
+    monkeypatch.setattr(ba, "sync_provider_models", forbidden)
+    monkeypatch.setattr(ba, "_do_sync_all_provider_models", forbidden)
+
+    asyncio.run(ba.refresh_gateway_rates())
+
+    registry = model_registry.get_registry()
+    assert registry.get_pricing_source("anthropic-m", "anthropic") == "exact"
+    assert registry.get_pricing_source("vertex-m", "vertex") == "exact"
+    assert model_registry._MODEL_LIST_CACHE == {}
+    _reset_registry()
+
+
 def test_sync_all_falls_back_when_all_fetches_fail(monkeypatch):
     """Every row's fetch failing → per-row cache gets bootstrap + extras,
     Bifrost allow-list gets the union."""
