@@ -15,18 +15,29 @@ the allowed direction).
 """
 
 import logging
-from typing import Any, Dict, List, Literal, Optional
+from collections.abc import Mapping
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidatorFunctionWrapHandler,
+    WrapSerializer,
+    WrapValidator,
+)
 
 from core.findings.exclusions import current_active_ips, excluded_ips_of
 from core.findings.source_evidence import (
+    StoredSourceEvidence,
     normalize_finding_source_evidence,
     project_finding_source_evidence_for_list,
 )
 from core.routing import Auth, RouterMeta
 from core.storage.database_data_service import DatabaseDataService
+from core.storage.schemas.finding import FindingSchema
 
 router = APIRouter()
 
@@ -76,8 +87,47 @@ class FindingUpdate(BaseModel):
     evidence_links: Optional[List[str]] = None
 
 
+class EntityContext(BaseModel):
+    """Free-form entity context; ``source_evidence`` is the one named key."""
+
+    model_config = ConfigDict(extra="allow")
+
+    source_evidence: Optional[StoredSourceEvidence] = None
+
+
+# A non-object entity_context stored in JSONB passes through untyped rather
+# than failing the response; the published schema stays EntityContext | null.
+def _validate_context(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+    return handler(value) if value is None or isinstance(value, Mapping) else value
+
+
+# No return annotation: pydantic would publish it as the serialized schema.
+def _serialize_context(value: Any, handler: SerializerFunctionWrapHandler):
+    return (
+        handler(value) if value is None or isinstance(value, EntityContext) else value
+    )
+
+
+TolerantEntityContext = Annotated[
+    Optional[EntityContext],
+    WrapValidator(_validate_context),
+    WrapSerializer(_serialize_context),
+]
+
+
+class FindingRecord(FindingSchema):
+    """A finding as the API returns it.
+
+    ``FindingSchema`` stays in the storage tier, which may not import the
+    findings domain, so the evidence type is narrowed here.
+    """
+
+    entity_context: TolerantEntityContext = None
+    excluded_ips: List[str] = Field(default_factory=list)
+
+
 class FindingListResponse(BaseModel):
-    findings: List[Dict[str, Any]] = Field(default_factory=list)
+    findings: List[FindingRecord] = Field(default_factory=list)
     total: int
     offset: int
     limit: int
@@ -96,7 +146,8 @@ class FindingUpdateResponse(BaseModel):
     updated_fields: List[str] = Field(default_factory=list)
 
 
-@router.get("", response_model=FindingListResponse)
+# exclude_unset: an envelope's absent payload keys must stay absent, not null.
+@router.get("", response_model=FindingListResponse, response_model_exclude_unset=True)
 def get_findings(
     severity: Optional[str] = Query(None),
     data_source: Optional[str] = Query(None),
@@ -158,10 +209,9 @@ def get_findings(
     }
 
 
-# No response_model: returns the normalized finding record verbatim. Its
-# shape is owned by FindingSchema (with ORM-parity tests); forcing a model
-# here would strip the normalized source_evidence. Snapshot pins the op.
-@router.get("/{finding_id}")
+@router.get(
+    "/{finding_id}", response_model=FindingRecord, response_model_exclude_unset=True
+)
 def get_finding(finding_id: str):
     """
     Get a specific finding by ID.
