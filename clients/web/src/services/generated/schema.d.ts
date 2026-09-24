@@ -9942,6 +9942,8 @@ export interface components {
                 [key: string]: unknown;
             };
             bounds: components["schemas"]["Bounds"];
+            /** Principal */
+            principal?: string | null;
             /** Tool */
             tool: string;
         };
