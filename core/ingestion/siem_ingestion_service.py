@@ -55,6 +55,14 @@ class SIEMIngestionService(ABC):
             Finding dictionary or None if transformation fails
         """
 
+    async def enrich_alert(self, alert: Dict[str, Any]) -> Dict[str, Any]:
+        """Add detail too costly to fetch for every alert in a poll window.
+
+        The daemon poller calls this only for alerts that passed dedup, just
+        before ``transform_alert_to_finding``. The default adds nothing.
+        """
+        return alert
+
     def ingest_alerts(
         self,
         start_time: Optional[datetime] = None,

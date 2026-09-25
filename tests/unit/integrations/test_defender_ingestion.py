@@ -87,3 +87,9 @@ class TestFetchFailures:
         ):
             with pytest.raises(httpx.HTTPError):
                 await ingestion.fetch_alerts(limit=10)
+
+
+@pytest.mark.asyncio
+async def test_default_enrich_alert_is_a_no_op(ingestion):
+    alert = {"id": "x"}
+    assert await ingestion.enrich_alert(alert) is alert
