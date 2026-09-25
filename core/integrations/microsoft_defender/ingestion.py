@@ -101,13 +101,20 @@ class MicrosoftDefenderIngestion(SIEMIngestionService):
 
         Returns:
             List of raw alert dictionaries
+
+        Raises:
+            Exception: no token or the API call failed. Raising, not returning
+                ``[]``, lets the poller tell a failed poll from an empty one
+                and keep its checkpoint.
         """
         try:
             # Token exchange and the alert fetch below are both blocking
             # HTTP; this method is async by interface, so offload them.
             token = await asyncio.to_thread(self._get_access_token)
             if not token:
-                return []
+                raise RuntimeError(
+                    "Microsoft Defender: could not obtain an access token"
+                )
 
             # Set time range
             if not start_time:
@@ -146,10 +153,10 @@ class MicrosoftDefenderIngestion(SIEMIngestionService):
 
         except (httpx.HTTPError, httpx.InvalidURL) as e:
             logger.error(f"Microsoft Defender API error: {e}")
-            return []
+            raise
         except Exception as e:
             logger.error(f"Error fetching Microsoft Defender alerts: {e}")
-            return []
+            raise
 
     def transform_alert_to_finding(
         self, alert: Dict[str, Any]

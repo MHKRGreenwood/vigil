@@ -43,6 +43,11 @@ class AWSSecurityHubIngestion(SIEMIngestionService):
 
         Returns:
             List of raw finding dictionaries
+
+        Raises:
+            Exception: boto3 is missing or the API call failed. Raising, not
+                returning ``[]``, lets the poller tell a failed poll from an
+                empty one and keep its checkpoint.
         """
         # boto3 is synchronous; keep it off the event loop.
         return await asyncio.to_thread(
@@ -110,13 +115,13 @@ class AWSSecurityHubIngestion(SIEMIngestionService):
 
         except ImportError:
             logger.error("boto3 not installed. Install: pip install boto3")
-            return []
+            raise
         except ClientError as e:
             logger.error(f"AWS Security Hub API error: {e}")
-            return []
+            raise
         except Exception as e:
             logger.error(f"Error fetching AWS Security Hub findings: {e}")
-            return []
+            raise
 
     def transform_alert_to_finding(
         self, alert: Dict[str, Any]
