@@ -81,15 +81,19 @@ class SIEMIngestionAdapter:
             # First run: small window so we don't backfill on enable.
             start_time = utcnow() - timedelta(minutes=1)
 
-        try:
-            alerts = await svc.fetch_alerts(start_time=start_time, limit=max_items)
-        except Exception as e:
-            logger.debug("%s fetch_alerts failed: %s", self.name, e)
-            alerts = []
+        # Taken before the fetch, so nothing created while it runs falls
+        # between this window and the next.
+        next_cursor = fresh_cursor()
+
+        # A failed fetch raises through to the runner, which records the
+        # failure and keeps the old cursor. Swallowing it here returned a fresh
+        # cursor and skipped every alert raised while the source was failing.
+        alerts = await svc.fetch_alerts(start_time=start_time, limit=max_items)
 
         findings = []
         for alert in (alerts or [])[:max_items]:
             try:
+                alert = await svc.enrich_alert(alert)
                 finding = svc.transform_alert_to_finding(alert)
             except Exception as e:
                 logger.debug("%s transform failed: %s", self.name, e)
@@ -109,4 +113,4 @@ class SIEMIngestionAdapter:
                     finding["external_id"] = fid
             findings.append(finding)
 
-        return FetchResult(findings=findings, cursor=fresh_cursor())
+        return FetchResult(findings=findings, cursor=next_cursor)
