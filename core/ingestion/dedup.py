@@ -151,14 +151,18 @@ class RedisDedupSet:
 
     async def save_checkpoint(self, when: datetime) -> None:
         """Record ``when`` (naive UTC, like ``core.time.utcnow``) as the last
-        clean poll. Expires with the dedup entries: a checkpoint older than the
-        set would re-admit findings the set has already forgotten."""
+        clean poll.
+
+        Deliberately no expiry: after an outage longer than the dedup TTL an
+        expired checkpoint would read as "never polled" and shrink the window
+        to the first-run lookback. Callers cap how far back they resume
+        instead (see ``poller._MAX_RESUME_WINDOW``)."""
         self._fallback_checkpoint = when
         r = await self._get_redis()
         if r is None:
             return
         try:
-            await r.set(self.checkpoint_key, when.isoformat(), ex=self.ttl_seconds)
+            await r.set(self.checkpoint_key, when.isoformat())
         except Exception as e:
             logger.debug(
                 "RedisDedupSet[%s] checkpoint write failed: %s", self.namespace, e

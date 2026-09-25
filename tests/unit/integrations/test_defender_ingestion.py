@@ -65,3 +65,25 @@ class TestTransformAlert:
 
     def test_handles_transform_error(self, ingestion):
         assert ingestion.transform_alert_to_finding(None) is None
+
+
+class TestFetchFailures:
+    """A failed fetch must raise, not read as an empty poll (the poller keeps
+    its checkpoint only when it can tell the two apart)."""
+
+    @pytest.mark.asyncio
+    async def test_no_token_raises(self, ingestion):
+        with patch.object(ingestion, "_get_access_token", return_value=None):
+            with pytest.raises(RuntimeError, match="access token"):
+                await ingestion.fetch_alerts(limit=10)
+
+    @pytest.mark.asyncio
+    async def test_http_error_raises(self, ingestion):
+        import httpx
+
+        with patch.object(ingestion, "_get_access_token", return_value="tok"), patch(
+            "core.integrations.microsoft_defender.ingestion.httpx.get",
+            side_effect=httpx.ConnectError("down"),
+        ):
+            with pytest.raises(httpx.HTTPError):
+                await ingestion.fetch_alerts(limit=10)

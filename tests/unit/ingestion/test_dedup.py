@@ -193,7 +193,7 @@ class TestCheckpoint:
 
         assert _run(go()) == when
 
-    def test_persists_with_the_dedup_ttl(self, monkeypatch):
+    def test_persists_without_expiry(self, monkeypatch):
         from datetime import datetime
 
         fake = _FakeRedis()
@@ -212,7 +212,8 @@ class TestCheckpoint:
 
         # A fresh instance (a restarted daemon) sees the saved checkpoint.
         assert _run(go()) == when
-        assert fake.expiry["vigil:checkpoint:unit-test"] == 3600
+        # No TTL: an expired checkpoint would read as "never polled".
+        assert fake.expiry["vigil:checkpoint:unit-test"] is None
 
     def test_unparseable_value_reads_as_none(self, monkeypatch):
         fake = _FakeRedis()
