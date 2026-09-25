@@ -4,16 +4,76 @@ Azure Sentinel Ingestion Service - Ingest incidents from Azure Sentinel.
 Fetches security incidents from Microsoft Sentinel (Azure Sentinel) and converts them to findings.
 """
 
+import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from core.config import get_integration_config
 from core.ingestion.siem_ingestion_service import SIEMIngestionService
+from core.integrations._base.config import missing, resolve
+from core.integrations.azure_sentinel.descriptor import AZURE_SENTINEL
 from core.time import utcnow
 
 logger = logging.getLogger(__name__)
+
+# What the incidents API needs. ``workspace_id`` (the Log Analytics GUID) is
+# the MCP server's query target; the management API addresses the workspace
+# by subscription, resource group and name instead.
+_REQUIRED_FIELDS = (
+    "tenant_id",
+    "client_id",
+    "client_secret",
+    "subscription_id",
+    "resource_group",
+    "workspace_name",
+)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Return ``value`` as an aware UTC datetime.
+
+    ``core.time.utcnow()`` is naive while the Azure SDK returns aware
+    timestamps, and comparing the two raises ``TypeError``.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _odata_time(value: datetime) -> str:
+    return _as_utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _incident_to_dict(incident: Any) -> Dict[str, Any]:
+    additional = incident.additional_data
+    owner = incident.owner
+    return {
+        "id": incident.name,
+        "incident_number": incident.incident_number,
+        "incident_url": incident.incident_url,
+        "title": incident.title,
+        "description": incident.description,
+        "severity": incident.severity,
+        "status": incident.status,
+        "classification": incident.classification,
+        "created_time": _iso(incident.created_time_utc),
+        "last_updated_time": _iso(incident.last_modified_time_utc),
+        "first_activity_time": _iso(incident.first_activity_time_utc),
+        "last_activity_time": _iso(incident.last_activity_time_utc),
+        "owner": (owner.email or owner.user_principal_name) if owner else None,
+        "labels": [label.label_name for label in incident.labels or []],
+        "tactics": list(additional.tactics or []) if additional else [],
+        "alert_count": (additional.alerts_count or 0) if additional else 0,
+        "alert_product_names": (
+            list(additional.alert_product_names or []) if additional else []
+        ),
+        "properties": incident.additional_properties or {},
+    }
 
 
 class AzureSentinelIngestion(SIEMIngestionService):
@@ -23,7 +83,7 @@ class AzureSentinelIngestion(SIEMIngestionService):
         """Initialize Azure Sentinel ingestion."""
         super().__init__()
         self.siem_name = "Azure Sentinel"
-        self.config = get_integration_config("azure-sentinel")
+        self.config = resolve(AZURE_SENTINEL)
 
     async def fetch_alerts(
         self,
@@ -40,105 +100,24 @@ class AzureSentinelIngestion(SIEMIngestionService):
             limit: Maximum number of incidents to fetch
 
         Returns:
-            List of raw incident dictionaries
+            List of raw incident dictionaries, newest first
         """
+        absent = missing(self.config, *_REQUIRED_FIELDS)
+        if absent:
+            logger.error(
+                "Azure Sentinel configuration incomplete, missing: %s",
+                ", ".join(absent),
+            )
+            return []
+
+        end_time = _as_utc(end_time or utcnow())
+        start_time = _as_utc(start_time or end_time - timedelta(hours=24))
+
         try:
-            from azure.identity import ClientSecretCredential
-            from azure.mgmt.securityinsight import SecurityInsights
-
-            # Get config
-            tenant_id = self.config.get("tenant_id")
-            client_id = self.config.get("client_id")
-            client_secret = self.config.get("client_secret")
-            subscription_id = self.config.get("subscription_id")
-            resource_group = self.config.get("resource_group")
-            workspace_name = self.config.get("workspace_name")
-
-            if not all(
-                [
-                    tenant_id,
-                    client_id,
-                    client_secret,
-                    subscription_id,
-                    resource_group,
-                    workspace_name,
-                ]
-            ):
-                logger.error("Azure Sentinel configuration incomplete")
-                return []
-
-            # Authenticate
-            credential = ClientSecretCredential(
-                tenant_id=tenant_id, client_id=client_id, client_secret=client_secret
+            # The Azure SDK is synchronous; keep it off the event loop.
+            incidents = await asyncio.to_thread(
+                self._list_incidents, start_time, end_time, limit
             )
-
-            # Create client
-            client = SecurityInsights(credential, subscription_id)
-
-            # Set time range
-            if not start_time:
-                start_time = utcnow() - timedelta(hours=24)
-            if not end_time:
-                end_time = utcnow()
-
-            # Fetch incidents
-            incidents = []
-            incident_list = client.incidents.list(
-                resource_group_name=resource_group, workspace_name=workspace_name
-            )
-
-            for incident in incident_list:
-                # Filter by time
-                if incident.created_time_utc:
-                    if (
-                        incident.created_time_utc < start_time
-                        or incident.created_time_utc > end_time
-                    ):
-                        continue
-
-                incidents.append(
-                    {
-                        "id": incident.name,
-                        "title": incident.title,
-                        "description": incident.description,
-                        "severity": incident.severity,
-                        "status": incident.status,
-                        "created_time": (
-                            incident.created_time_utc.isoformat()
-                            if incident.created_time_utc
-                            else None
-                        ),
-                        "last_updated_time": (
-                            incident.last_updated_time_utc.isoformat()
-                            if incident.last_updated_time_utc
-                            else None
-                        ),
-                        "owner": incident.owner.email if incident.owner else None,
-                        "labels": (
-                            [label.label_name for label in incident.labels]
-                            if incident.labels
-                            else []
-                        ),
-                        "tactics": (
-                            incident.additional_data.tactics
-                            if incident.additional_data
-                            else []
-                        ),
-                        "alert_count": (
-                            incident.additional_data.alert_count
-                            if incident.additional_data
-                            else 0
-                        ),
-                        "properties": incident.additional_properties or {},
-                    }
-                )
-
-                if len(incidents) >= limit:
-                    break
-
-            logger.info(f"Fetched {len(incidents)} incidents from Azure Sentinel")
-            return incidents
-
         except ImportError:
             logger.error(
                 "Azure SDK not installed. Install: pip install azure-mgmt-securityinsight azure-identity"
@@ -147,6 +126,42 @@ class AzureSentinelIngestion(SIEMIngestionService):
         except Exception as e:
             logger.error(f"Error fetching Azure Sentinel incidents: {e}")
             return []
+
+        logger.info(f"Fetched {len(incidents)} incidents from Azure Sentinel")
+        return incidents
+
+    def _list_incidents(
+        self, start_time: datetime, end_time: datetime, limit: int
+    ) -> List[Dict[str, Any]]:
+        from azure.identity import ClientSecretCredential
+        from azure.mgmt.securityinsight import SecurityInsights
+
+        credential = ClientSecretCredential(
+            tenant_id=self.config["tenant_id"],
+            client_id=self.config["client_id"],
+            client_secret=self.config["client_secret"],
+        )
+        client = SecurityInsights(credential, self.config["subscription_id"])
+
+        # Filter and order server-side; listing every incident in the
+        # workspace on each poll grows without bound.
+        pages = client.incidents.list(
+            resource_group_name=self.config["resource_group"],
+            workspace_name=self.config["workspace_name"],
+            filter=f"properties/createdTimeUtc ge {_odata_time(start_time)}",
+            orderby="properties/createdTimeUtc desc",
+            top=min(limit, 1000),
+        )
+
+        incidents: List[Dict[str, Any]] = []
+        for incident in pages:
+            created = incident.created_time_utc
+            if created and _as_utc(created) > end_time:
+                continue
+            incidents.append(_incident_to_dict(incident))
+            if len(incidents) >= limit:
+                break
+        return incidents
 
     def transform_alert_to_finding(
         self, alert: Dict[str, Any]

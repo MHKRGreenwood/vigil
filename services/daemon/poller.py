@@ -30,10 +30,6 @@ from services.daemon.config import PollingConfig
 logger = logging.getLogger(__name__)
 
 
-class IngestionError(RuntimeError):
-    """An ingestion service reported success=False for a poll."""
-
-
 def normalize_mitre_predictions(raw: Any, finding_id: str) -> Dict[str, float]:
     """Coerce a webhook ``mitre_predictions`` value to the canonical
     ``{technique_id: confidence}`` dict every consumer assumes.
@@ -735,19 +731,32 @@ class DataPoller:
         self.stats[f"{source}_polls"] += 1
         logger.debug("Polling %s for new %s...", label, noun)
 
-        result = service.ingest_alerts(limit=100)
+        # Fetch, dedup and enqueue like the Elastic path. ``ingest_alerts``
+        # is a synchronous wrapper that calls ``asyncio.run`` -- which raises
+        # inside this running loop -- and writes straight to storage, so its
+        # findings would skip dedup and the processor (no triage) even if it
+        # ran. Resume from the last clean poll so a slow or restarted daemon
+        # does not open a gap; dedup absorbs the overlap.
+        state = getattr(self, f"_{source}_state")
+        dedup = getattr(self, f"_{source}_dedup")
+        lookback = timedelta(minutes=max(self.config.splunk_interval // 60 + 1, 5))
+        start_time = utcnow() - lookback
+        if state.last_poll_time:
+            start_time = min(start_time, state.last_poll_time - timedelta(minutes=1))
 
-        if not result.get("success"):
-            # Raise rather than log: the loop is what counts an error and what
-            # decides whether to stamp last_poll_time. Returning quietly here
-            # recorded a failed poll as a clean one -- the same blind spot the
-            # bare `except: log` in these pollers used to have, reached by the
-            # other branch.
-            raise IngestionError(f"{label} ingestion failed: {result.get('errors')}")
+        alerts = await service.fetch_alerts(start_time=start_time, limit=100)
 
-        ingested = result.get("ingested", 0)
-        self.stats[f"{source}_findings"] += ingested
-        logger.info("%s: ingested %d %s", label, ingested, noun)
+        new_count = 0
+        for alert in alerts:
+            finding = service.transform_alert_to_finding(alert)
+            if finding and not await dedup.is_processed(finding["finding_id"]):
+                if await self._enqueue_finding(finding, source):
+                    await dedup.mark_processed(finding["finding_id"])
+                    new_count += 1
+
+        self.stats[f"{source}_findings"] += new_count
+        if new_count:
+            logger.info("%s: %d new %s", label, new_count, noun)
 
     async def _poll_ingestion_loop(self, source: str, shutdown_event: asyncio.Event):
         """Poll an ingestion-service source on interval until shutdown."""

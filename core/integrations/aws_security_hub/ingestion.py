@@ -4,6 +4,7 @@ AWS Security Hub Ingestion Service - Ingest findings from AWS Security Hub.
 Fetches security findings from AWS Security Hub and converts them to the standard finding format.
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -43,6 +44,17 @@ class AWSSecurityHubIngestion(SIEMIngestionService):
         Returns:
             List of raw finding dictionaries
         """
+        # boto3 is synchronous; keep it off the event loop.
+        return await asyncio.to_thread(
+            self._fetch_findings, start_time, end_time, limit
+        )
+
+    def _fetch_findings(
+        self,
+        start_time: Optional[datetime],
+        end_time: Optional[datetime],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
         try:
             import boto3
             from botocore.exceptions import ClientError

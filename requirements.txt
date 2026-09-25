@@ -17,6 +17,9 @@ httpx>=0.27.0
 requests>=2.34.2
 urllib3>=2.8.0
 boto3>=1.43.77
+# Azure Sentinel incident polling (core/integrations/azure_sentinel/ingestion.py).
+azure-identity>=1.25.0
+azure-mgmt-securityinsight>=1.0.0
 aiohttp>=3.9.0
 
 # Core declared transitive deps
