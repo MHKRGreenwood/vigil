@@ -139,3 +139,51 @@ async def test_slack_escalation_does_not_block_the_loop():
         f"loop served only {ticks} ticks during Slack escalation — the POST "
         "is running on the event loop"
     )
+
+
+_SENTINEL_CONFIG = {
+    "tenant_id": "tenant",
+    "client_id": "client",
+    "client_secret": "secret",
+    "subscription_id": "sub",
+    "resource_group": "rg",
+    "workspace_name": "ws",
+}
+
+
+@pytest.mark.asyncio
+async def test_sentinel_fetch_alerts_does_not_block_the_loop():
+    from core.integrations.azure_sentinel.ingestion import AzureSentinelIngestion
+
+    with patch(
+        "core.integrations.azure_sentinel.ingestion.resolve",
+        return_value=dict(_SENTINEL_CONFIG),
+    ):
+        svc = AzureSentinelIngestion()
+
+    with patch.object(svc, "_list_incidents", _blocking([])):
+        _, ticks = await _tick_while(svc.fetch_alerts(limit=10))
+
+    assert ticks >= MIN_TICKS, (
+        f"loop served only {ticks} ticks during the Sentinel fetch — the "
+        "synchronous Azure SDK is running on the event loop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_security_hub_fetch_alerts_does_not_block_the_loop():
+    from core.integrations.aws_security_hub.ingestion import AWSSecurityHubIngestion
+
+    with patch(
+        "core.integrations.aws_security_hub.ingestion.resolve",
+        return_value={},
+    ):
+        svc = AWSSecurityHubIngestion()
+
+    with patch.object(svc, "_fetch_findings", _blocking([])):
+        _, ticks = await _tick_while(svc.fetch_alerts(limit=10))
+
+    assert ticks >= MIN_TICKS, (
+        f"loop served only {ticks} ticks during the Security Hub fetch — "
+        "boto3 is running on the event loop"
+    )

@@ -37,6 +37,19 @@ attrs==26.1.0
     #   aiohttp
     #   jsonschema
     #   referencing
+azure-common==1.1.28
+    # via azure-mgmt-securityinsight
+azure-core==1.41.0
+    # via
+    #   azure-identity
+    #   azure-mgmt-core
+    #   msrest
+azure-identity==1.25.3
+    # via -r requirements.txt
+azure-mgmt-core==1.6.0
+    # via azure-mgmt-securityinsight
+azure-mgmt-securityinsight==1.0.0
+    # via -r requirements.txt
 bcrypt==5.0.0
     # via
     #   -r requirements.txt
@@ -53,6 +66,7 @@ certifi==2026.7.22
     # via
     #   httpcore
     #   httpx
+    #   msrest
     #   requests
     #   sentry-sdk
 cffi==2.1.1 ; platform_python_implementation != 'PyPy'
@@ -76,6 +90,8 @@ coverage==7.15.4
 cryptography==50.0.1
     # via
     #   -r requirements.txt
+    #   azure-identity
+    #   msal
     #   paramiko
     #   pyjwt
 deprecated==1.3.1
@@ -140,6 +156,8 @@ iniconfig==2.3.0
     # via pytest
 invoke==3.0.3
     # via paramiko
+isodate==0.7.2
+    # via msrest
 itsdangerous==2.2.0
     # via -r requirements.txt
 jiter==0.16.0
@@ -160,14 +178,24 @@ mcp==2.1.1
     # via -r requirements.txt
 mcp-types==2.1.1
     # via mcp
+msal==1.39.0
+    # via
+    #   azure-identity
+    #   msal-extensions
+msal-extensions==1.3.1
+    # via azure-identity
 msgpack==1.2.1
     # via bullmq
+msrest==0.7.1
+    # via azure-mgmt-securityinsight
 multidict==6.7.1
     # via
     #   aiohttp
     #   yarl
 numpy==2.5.3
     # via -r requirements.txt
+oauthlib==3.3.1
+    # via requests-oauthlib
 openai==3.3.1
     # via -r requirements.txt
 opentelemetry-api==1.44.0
@@ -292,6 +320,7 @@ pyjwt==2.13.0
     # via
     #   -r requirements.txt
     #   mcp
+    #   msal
     #   redis
 pynacl==1.6.2
     # via paramiko
@@ -345,9 +374,15 @@ reportlab==5.0.1
 requests==2.34.2
     # via
     #   -r requirements.txt
+    #   azure-core
+    #   msal
+    #   msrest
     #   opentelemetry-exporter-otlp-proto-http
+    #   requests-oauthlib
     #   stix2
     #   taxii2-client
+requests-oauthlib==2.0.0
+    # via msrest
 respx==0.23.1
     # via -r requirements.txt
 rpds-py==2026.6.3
@@ -402,6 +437,8 @@ typing-extensions==4.16.0
     #   aiosignal
     #   anthropic
     #   anyio
+    #   azure-core
+    #   azure-identity
     #   fastapi
     #   grpcio
     #   httpx2

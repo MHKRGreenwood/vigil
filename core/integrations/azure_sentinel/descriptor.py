@@ -16,6 +16,11 @@ AZURE_SENTINEL = register_descriptor(
             IntegrationField("tenant_id"),
             IntegrationField("client_id"),
             IntegrationField("client_secret", secret=True),
+            # The incidents poller calls the management API, which addresses
+            # the workspace by subscription, resource group and name.
+            IntegrationField("subscription_id"),
+            IntegrationField("resource_group"),
+            IntegrationField("workspace_name"),
         ),
     )
 )
