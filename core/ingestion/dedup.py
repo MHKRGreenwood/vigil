@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import Optional
 
 from core.config import DEFAULT_REDIS_URL, get_settings
@@ -48,12 +49,14 @@ class RedisDedupSet:
     ):
         self.namespace = namespace
         self.key = f"vigil:dedup:{namespace}"
+        self.checkpoint_key = f"vigil:checkpoint:{namespace}"
         self.redis_url = redis_url or get_settings().redis_url or DEFAULT_REDIS_URL
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
 
         self._redis = None
         self._fallback: set[str] = set()
+        self._fallback_checkpoint: Optional[datetime] = None
         self._fallback_warned = False
         self._lock = asyncio.Lock()
 
@@ -121,6 +124,45 @@ class RedisDedupSet:
             self._warn_fallback(f"zadd error: {e}")
             self._redis = None
             self._fallback.add(finding_id)
+
+    async def load_checkpoint(self) -> Optional[datetime]:
+        """Last clean poll time saved by :meth:`save_checkpoint`, or None.
+
+        Lets a poller resume its query window across restarts instead of
+        starting from a short lookback and skipping whatever arrived while it
+        was down. Stored beside the dedup set so both share one lifetime.
+        """
+        r = await self._get_redis()
+        if r is None:
+            return self._fallback_checkpoint
+        try:
+            raw = await r.get(self.checkpoint_key)
+        except Exception as e:
+            logger.debug(
+                "RedisDedupSet[%s] checkpoint read failed: %s", self.namespace, e
+            )
+            return self._fallback_checkpoint
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    async def save_checkpoint(self, when: datetime) -> None:
+        """Record ``when`` (naive UTC, like ``core.time.utcnow``) as the last
+        clean poll. Expires with the dedup entries: a checkpoint older than the
+        set would re-admit findings the set has already forgotten."""
+        self._fallback_checkpoint = when
+        r = await self._get_redis()
+        if r is None:
+            return
+        try:
+            await r.set(self.checkpoint_key, when.isoformat(), ex=self.ttl_seconds)
+        except Exception as e:
+            logger.debug(
+                "RedisDedupSet[%s] checkpoint write failed: %s", self.namespace, e
+            )
 
     async def size(self) -> int:
         r = await self._get_redis()

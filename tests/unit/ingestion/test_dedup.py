@@ -10,6 +10,7 @@ marker.
 from __future__ import annotations
 
 import asyncio
+
 import pytest
 
 from core.ingestion.dedup import RedisDedupSet
@@ -158,3 +159,68 @@ class TestRedisDedupWithFakeRedis:
         seen_keep_1, seen_missing = _run(go())
         assert seen_keep_1 is True
         assert seen_missing is False
+
+
+class _FakeRedis:
+    """Just the string commands the checkpoint uses."""
+
+    def __init__(self):
+        self.store = {}
+        self.expiry = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+        self.expiry[key] = ex
+
+
+class TestCheckpoint:
+    def test_none_before_first_save(self, no_redis):
+        dedup = _make()
+        assert _run(dedup.load_checkpoint()) is None
+
+    def test_fallback_round_trip(self, no_redis):
+        from datetime import datetime
+
+        dedup = _make()
+        when = datetime(2026, 9, 25, 18, 0)
+
+        async def go():
+            await dedup.save_checkpoint(when)
+            return await dedup.load_checkpoint()
+
+        assert _run(go()) == when
+
+    def test_persists_with_the_dedup_ttl(self, monkeypatch):
+        from datetime import datetime
+
+        fake = _FakeRedis()
+        writer, reader = _make(), _make()
+        for d in (writer, reader):
+
+            async def _redis(_fake=fake):
+                return _fake
+
+            monkeypatch.setattr(d, "_get_redis", _redis)
+        when = datetime(2026, 9, 25, 18, 0)
+
+        async def go():
+            await writer.save_checkpoint(when)
+            return await reader.load_checkpoint()
+
+        # A fresh instance (a restarted daemon) sees the saved checkpoint.
+        assert _run(go()) == when
+        assert fake.expiry["vigil:checkpoint:unit-test"] == 3600
+
+    def test_unparseable_value_reads_as_none(self, monkeypatch):
+        fake = _FakeRedis()
+        fake.store["vigil:checkpoint:unit-test"] = "not-a-date"
+        dedup = _make()
+
+        async def _redis():
+            return fake
+
+        monkeypatch.setattr(dedup, "_get_redis", _redis)
+        assert _run(dedup.load_checkpoint()) is None
