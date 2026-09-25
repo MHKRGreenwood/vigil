@@ -23,11 +23,22 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from core.federation.runner import FederationRunner
-from core.ingestion.dedup import RedisDedupSet
+from core.ingestion.dedup import DEFAULT_TTL_SECONDS, RedisDedupSet
 from core.time import utcnow
 from services.daemon.config import PollingConfig
 
 logger = logging.getLogger(__name__)
+
+# How far back an ingestion poll may resume: an hour inside the dedup set's
+# memory, so everything re-fetched is still recognised as already processed.
+_MAX_RESUME_WINDOW = timedelta(seconds=DEFAULT_TTL_SECONDS) - timedelta(hours=1)
+# Per-poll cap for ingestion-service sources. A resumed window can span an
+# outage, so it is sized for that rather than for one interval.
+_INGESTION_POLL_LIMIT = 1000
+
+
+class IngestionError(RuntimeError):
+    """A poll did not complete cleanly; the loop counts it as an error."""
 
 
 def normalize_mitre_predictions(raw: Any, finding_id: str) -> Dict[str, float]:
@@ -735,40 +746,63 @@ class DataPoller:
         # is a synchronous wrapper that calls ``asyncio.run`` -- which raises
         # inside this running loop -- and writes straight to storage, so its
         # findings would skip dedup and the processor (no triage) even if it
-        # ran. Resume from the last clean poll so a slow or restarted daemon
-        # does not open a gap; dedup absorbs the overlap.
+        # ran.
+        #
+        # The window resumes from the last clean poll, persisted beside the
+        # dedup set so a restart resumes too; dedup absorbs the overlap. Only a
+        # clean poll moves the checkpoint: a fetch that raises or a finding the
+        # queue refuses leaves it put, so the next poll asks again.
         state = getattr(self, f"_{source}_state")
         dedup = getattr(self, f"_{source}_dedup")
+        if state.last_poll_time is None:
+            state.last_poll_time = await dedup.load_checkpoint()
+
+        polled_at = utcnow()
         lookback = timedelta(minutes=max(self.config.splunk_interval // 60 + 1, 5))
-        start_time = utcnow() - lookback
+        start_time = polled_at - lookback
         if state.last_poll_time:
             start_time = min(start_time, state.last_poll_time - timedelta(minutes=1))
+        # Never reach back past what the dedup set still remembers, or a long
+        # outage would re-triage findings it has already forgotten.
+        start_time = max(start_time, polled_at - _MAX_RESUME_WINDOW)
 
-        alerts = await service.fetch_alerts(start_time=start_time, limit=100)
+        alerts = await service.fetch_alerts(
+            start_time=start_time, limit=_INGESTION_POLL_LIMIT
+        )
 
         new_count = 0
+        refused = 0
         for alert in alerts:
             finding = service.transform_alert_to_finding(alert)
             if finding and not await dedup.is_processed(finding["finding_id"]):
                 if await self._enqueue_finding(finding, source):
                     await dedup.mark_processed(finding["finding_id"])
                     new_count += 1
+                else:
+                    refused += 1
 
         self.stats[f"{source}_findings"] += new_count
         if new_count:
             logger.info("%s: %d new %s", label, new_count, noun)
+        if refused:
+            raise IngestionError(
+                f"{label}: {refused} {noun} not accepted for processing; "
+                "keeping the checkpoint so the next poll retries them"
+            )
+
+        state.last_poll_time = polled_at
+        await dedup.save_checkpoint(polled_at)
 
     async def _poll_ingestion_loop(self, source: str, shutdown_event: asyncio.Event):
         """Poll an ingestion-service source on interval until shutdown."""
         label, _ = self._INGESTION_SOURCES[source]
-        state = getattr(self, f"_{source}_state")
         interval = self.config.splunk_interval  # Use same interval as Splunk
         logger.info(f"{label} polling loop started (interval: {interval}s)")
 
         while not shutdown_event.is_set():
             try:
+                # Stamps its own checkpoint, and only after a clean poll.
                 await self._poll_ingestion_source(source)
-                state.last_poll_time = utcnow()
             except Exception as e:
                 logger.error(f"{label} polling error: {e}")
                 self.stats["errors"] += 1

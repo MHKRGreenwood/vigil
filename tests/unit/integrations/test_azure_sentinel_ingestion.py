@@ -18,6 +18,7 @@ import pytest
 import core.integrations._base.config as resolver
 from core.integrations.azure_sentinel import ingestion as sentinel
 from core.integrations.azure_sentinel.ingestion import AzureSentinelIngestion
+from core.time import utcnow
 
 pytestmark = pytest.mark.unit
 
@@ -96,11 +97,19 @@ class TestConfig:
         assert set(sentinel._REQUIRED_FIELDS) <= names
 
     @pytest.mark.asyncio
-    async def test_incomplete_config_skips_the_sdk(self):
+    async def test_incomplete_config_raises_without_calling_the_sdk(self):
         svc = _service({**_CONFIG, "workspace_name": None})
         with patch.object(svc, "_list_incidents") as listing:
-            assert await svc.fetch_alerts() == []
+            with pytest.raises(RuntimeError, match="workspace_name"):
+                await svc.fetch_alerts()
         listing.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_api_failure_raises_instead_of_reading_as_empty(self):
+        svc = _service()
+        with patch.object(svc, "_list_incidents", side_effect=PermissionError("403")):
+            with pytest.raises(PermissionError):
+                await svc.fetch_alerts()
 
 
 class TestIncidentMapping:
@@ -187,6 +196,22 @@ class TestListIncidents:
         assert kwargs["orderby"] == "properties/createdTimeUtc desc"
 
     @pytest.mark.asyncio
+    async def test_reuses_one_client_across_polls(self):
+        pytest.importorskip("azure.identity")
+        pytest.importorskip("azure.mgmt.securityinsight")
+        svc = _service()
+        client = MagicMock()
+        client.incidents.list.return_value = []
+
+        with patch("azure.identity.ClientSecretCredential") as cred, patch(
+            "azure.mgmt.securityinsight.SecurityInsights", return_value=client
+        ):
+            await svc.fetch_alerts()
+            await svc.fetch_alerts()
+
+        assert cred.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_stops_at_the_limit(self):
         pytest.importorskip("azure.identity")
         pytest.importorskip("azure.mgmt.securityinsight")
@@ -206,7 +231,7 @@ class TestListIncidents:
         assert len(incidents) == 3
 
 
-def _make_poller():
+def _make_poller(checkpoint=None):
     from services.daemon.config import PollingConfig
     from services.daemon.poller import DataPoller
 
@@ -214,27 +239,35 @@ def _make_poller():
         patch("services.daemon.poller.FederationRunner"),
         patch("services.daemon.poller.RedisDedupSet"),
     ):
-        return DataPoller(PollingConfig())
+        poller = DataPoller(PollingConfig())
+    poller._federation.is_active_for = MagicMock(return_value=False)
+    dedup = MagicMock()
+    dedup.is_processed = AsyncMock(return_value=False)
+    dedup.mark_processed = AsyncMock()
+    dedup.load_checkpoint = AsyncMock(return_value=checkpoint)
+    dedup.save_checkpoint = AsyncMock()
+    poller._azure_sentinel_dedup = dedup
+    poller._enqueue_finding = AsyncMock(return_value=True)
+    return poller
+
+
+def _sentinel_service(alerts=()):
+    service = MagicMock()
+    service.fetch_alerts = AsyncMock(return_value=list(alerts))
+    service.transform_alert_to_finding.side_effect = lambda a: {
+        "finding_id": f"sentinel-{a['id']}"
+    }
+    return service
 
 
 class TestPoller:
     @pytest.mark.asyncio
     async def test_ingestion_sources_dedup_and_enqueue_for_triage(self):
         poller = _make_poller()
-        poller._federation.is_active_for = MagicMock(return_value=False)
-
-        service = MagicMock()
-        service.fetch_alerts = AsyncMock(return_value=[{"id": "a"}, {"id": "b"}])
-        service.transform_alert_to_finding.side_effect = lambda a: {
-            "finding_id": f"sentinel-{a['id']}"
-        }
+        service = _sentinel_service([{"id": "a"}, {"id": "b"}])
         poller._azure_sentinel_service = service
-
-        dedup = MagicMock()
+        dedup = poller._azure_sentinel_dedup
         dedup.is_processed = AsyncMock(side_effect=lambda fid: fid == "sentinel-b")
-        dedup.mark_processed = AsyncMock()
-        poller._azure_sentinel_dedup = dedup
-        poller._enqueue_finding = AsyncMock(return_value=True)
 
         await poller._poll_ingestion_source("azure_sentinel")
 
@@ -246,16 +279,82 @@ class TestPoller:
         assert poller.stats["azure_sentinel_findings"] == 1
 
     @pytest.mark.asyncio
+    async def test_clean_poll_saves_the_checkpoint(self):
+        poller = _make_poller()
+        poller._azure_sentinel_service = _sentinel_service()
+
+        await poller._poll_ingestion_source("azure_sentinel")
+
+        saved = poller._azure_sentinel_dedup.save_checkpoint.await_args.args[0]
+        assert poller._azure_sentinel_state.last_poll_time == saved
+
+    @pytest.mark.asyncio
     async def test_resumes_from_the_last_clean_poll(self):
         poller = _make_poller()
-        poller._federation.is_active_for = MagicMock(return_value=False)
-        service = MagicMock()
-        service.fetch_alerts = AsyncMock(return_value=[])
+        service = _sentinel_service()
         poller._azure_sentinel_service = service
-        last = datetime(2026, 9, 25, 10, 0)
+        last = utcnow() - timedelta(hours=2)
         poller._azure_sentinel_state.last_poll_time = last
 
         await poller._poll_ingestion_source("azure_sentinel")
 
         start = service.fetch_alerts.await_args.kwargs["start_time"]
         assert start == last - timedelta(minutes=1)
+
+    @pytest.mark.asyncio
+    async def test_a_restart_resumes_from_the_saved_checkpoint(self):
+        saved = utcnow() - timedelta(hours=3)
+        poller = _make_poller(checkpoint=saved)
+        service = _sentinel_service()
+        poller._azure_sentinel_service = service
+
+        await poller._poll_ingestion_source("azure_sentinel")
+
+        start = service.fetch_alerts.await_args.kwargs["start_time"]
+        assert start == saved - timedelta(minutes=1)
+
+    @pytest.mark.asyncio
+    async def test_resume_window_stays_inside_dedup_memory(self):
+        from services.daemon.poller import _MAX_RESUME_WINDOW
+
+        poller = _make_poller(checkpoint=utcnow() - timedelta(days=3))
+        service = _sentinel_service()
+        poller._azure_sentinel_service = service
+
+        before = utcnow()
+        await poller._poll_ingestion_source("azure_sentinel")
+
+        start = service.fetch_alerts.await_args.kwargs["start_time"]
+        assert start >= before - _MAX_RESUME_WINDOW
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_keeps_the_checkpoint_and_counts_an_error(self):
+        poller = _make_poller()
+        service = _sentinel_service()
+        service.fetch_alerts = AsyncMock(side_effect=PermissionError("403"))
+        poller._azure_sentinel_service = service
+        last = utcnow() - timedelta(hours=1)
+        poller._azure_sentinel_state.last_poll_time = last
+        shutdown = MagicMock()
+        shutdown.is_set.side_effect = [False, True]
+        shutdown.wait = AsyncMock()
+
+        await poller._poll_ingestion_loop("azure_sentinel", shutdown)
+
+        assert poller._azure_sentinel_state.last_poll_time == last
+        poller._azure_sentinel_dedup.save_checkpoint.assert_not_awaited()
+        assert poller.stats["errors"] == 1
+
+    @pytest.mark.asyncio
+    async def test_refused_finding_keeps_the_checkpoint(self):
+        from services.daemon.poller import IngestionError
+
+        poller = _make_poller()
+        poller._azure_sentinel_service = _sentinel_service([{"id": "a"}])
+        poller._enqueue_finding = AsyncMock(return_value=False)
+
+        with pytest.raises(IngestionError):
+            await poller._poll_ingestion_source("azure_sentinel")
+
+        poller._azure_sentinel_dedup.mark_processed.assert_not_awaited()
+        poller._azure_sentinel_dedup.save_checkpoint.assert_not_awaited()

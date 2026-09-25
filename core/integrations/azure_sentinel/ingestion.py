@@ -84,6 +84,7 @@ class AzureSentinelIngestion(SIEMIngestionService):
         super().__init__()
         self.siem_name = "Azure Sentinel"
         self.config = resolve(AZURE_SENTINEL)
+        self._client = None
 
     async def fetch_alerts(
         self,
@@ -101,14 +102,18 @@ class AzureSentinelIngestion(SIEMIngestionService):
 
         Returns:
             List of raw incident dictionaries, newest first
+
+        Raises:
+            RuntimeError: the configuration is incomplete.
+            Exception: the SDK is missing or the API call failed. Raising, not
+                returning ``[]``, is what lets the poller tell a failed poll
+                from an empty one and keep its checkpoint.
         """
         absent = missing(self.config, *_REQUIRED_FIELDS)
         if absent:
-            logger.error(
-                "Azure Sentinel configuration incomplete, missing: %s",
-                ", ".join(absent),
+            raise RuntimeError(
+                f"Azure Sentinel configuration incomplete, missing: {', '.join(absent)}"
             )
-            return []
 
         end_time = _as_utc(end_time or utcnow())
         start_time = _as_utc(start_time or end_time - timedelta(hours=24))
@@ -122,26 +127,33 @@ class AzureSentinelIngestion(SIEMIngestionService):
             logger.error(
                 "Azure SDK not installed. Install: pip install azure-mgmt-securityinsight azure-identity"
             )
-            return []
+            raise
         except Exception as e:
             logger.error(f"Error fetching Azure Sentinel incidents: {e}")
-            return []
+            raise
 
         logger.info(f"Fetched {len(incidents)} incidents from Azure Sentinel")
         return incidents
 
+    def _get_client(self):
+        # One credential for the service's lifetime, so its token is cached
+        # across polls instead of re-issued every interval.
+        if self._client is None:
+            from azure.identity import ClientSecretCredential
+            from azure.mgmt.securityinsight import SecurityInsights
+
+            credential = ClientSecretCredential(
+                tenant_id=self.config["tenant_id"],
+                client_id=self.config["client_id"],
+                client_secret=self.config["client_secret"],
+            )
+            self._client = SecurityInsights(credential, self.config["subscription_id"])
+        return self._client
+
     def _list_incidents(
         self, start_time: datetime, end_time: datetime, limit: int
     ) -> List[Dict[str, Any]]:
-        from azure.identity import ClientSecretCredential
-        from azure.mgmt.securityinsight import SecurityInsights
-
-        credential = ClientSecretCredential(
-            tenant_id=self.config["tenant_id"],
-            client_id=self.config["client_id"],
-            client_secret=self.config["client_secret"],
-        )
-        client = SecurityInsights(credential, self.config["subscription_id"])
+        client = self._get_client()
 
         # Filter and order server-side; listing every incident in the
         # workspace on each poll grows without bound.
@@ -158,9 +170,16 @@ class AzureSentinelIngestion(SIEMIngestionService):
             created = incident.created_time_utc
             if created and _as_utc(created) > end_time:
                 continue
-            incidents.append(_incident_to_dict(incident))
             if len(incidents) >= limit:
+                # Newest first, so what is dropped is the oldest of the window.
+                logger.warning(
+                    "Azure Sentinel: more than %d incidents since %s; the oldest "
+                    "were not fetched this poll",
+                    limit,
+                    _odata_time(start_time),
+                )
                 break
+            incidents.append(_incident_to_dict(incident))
         return incidents
 
     def transform_alert_to_finding(
