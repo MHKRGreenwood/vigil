@@ -156,14 +156,41 @@ class TestIncidentMapping:
         extra = set(models.IncidentAdditionalData._attribute_map)
         assert {"tactics", "alerts_count", "alert_product_names"} <= extra
 
-    def test_transform_produces_an_underscore_sourced_finding(self):
+    def test_transform_emits_the_keys_ingest_finding_persists(self):
         svc = _service()
         finding = svc.transform_alert_to_finding(
             sentinel._incident_to_dict(_incident())
         )
         assert finding["finding_id"] == "sentinel-inc-1"
         assert finding["data_source"] == "azure_sentinel"
-        assert finding["metadata"]["alert_count"] == 2
+        assert finding["status"] == "new"
+        assert finding["severity"] == "info"
+        assert finding["mitre_predictions"] == {}
+        ctx = finding["entity_context"]
+        assert ctx["alert_count"] == 2
+        assert ctx["tactics"] == ["Execution"]
+        assert ctx["incident_number"] == 42
+        assert finding["evidence_links"] == [
+            {"type": "incident", "ref": "https://portal.example/incident/42"}
+        ]
+
+    def test_title_leads_the_description(self):
+        # No title column in storage; the backfill re-triages from the row.
+        svc = _service()
+        finding = svc.transform_alert_to_finding(
+            sentinel._incident_to_dict(_incident())
+        )
+        assert finding["title"] == "EICAR test file prevented"
+        assert finding["description"] == (
+            "EICAR test file prevented\n\nDefender blocked a test file"
+        )
+
+    def test_description_falls_back_to_title(self):
+        svc = _service()
+        for detail in ("", "   ", "EICAR test file prevented"):
+            alert = sentinel._incident_to_dict(_incident(description=detail))
+            finding = svc.transform_alert_to_finding(alert)
+            assert finding["description"] == "EICAR test file prevented"
 
 
 class TestListIncidents:
@@ -231,6 +258,102 @@ class TestListIncidents:
         assert len(incidents) == 3
 
 
+class TestEntities:
+    _ENTITIES = [
+        {"kind": "Host", "host_name": "mhk-rg-ws", "dns_domain": "corp.example"},
+        {"kind": "Account", "account_name": "jsmith", "upn_suffix": "corp.example"},
+        {"kind": "Account", "account_name": "svc", "nt_domain": "CORP"},
+        {"kind": "Ip", "address": "198.51.100.42"},
+        {"kind": "Url", "url": "https://www.eicar.org/"},
+        {"kind": "DnsResolution", "domain_name": "evil.example"},
+        {"kind": "FileHash", "hash_value": "275a02", "algorithm": "SHA256"},
+        {"kind": "File", "file_name": "eicar.com"},
+        {"kind": "Mailbox", "mailbox_primary_address": "tdoe@corp.example"},
+        {
+            "kind": "MailMessage",
+            "recipient": "tdoe@corp.example",
+            "p1_sender": "phish@example.net",
+            "sender_ip": "203.0.113.9",
+        },
+        {"kind": "CloudApplication", "app_name": "Office 365"},
+        {"kind": "MailCluster", "friendly_name": "urn:cluster"},
+    ]
+
+    def test_maps_entities_onto_triage_keys(self):
+        ctx = sentinel._entity_context(self._ENTITIES)
+        assert ctx["hostnames"] == ["mhk-rg-ws.corp.example"]
+        assert ctx["usernames"] == [
+            "jsmith@corp.example",
+            "CORP\\svc",
+            "tdoe@corp.example",
+        ]
+        assert ctx["src_ips"] == ["198.51.100.42", "203.0.113.9"]
+        assert ctx["domains"] == ["https://www.eicar.org/", "evil.example"]
+        assert ctx["file_hashes"] == ["275a02"]
+        assert ctx["file_names"] == ["eicar.com"]
+        assert ctx["email_senders"] == ["phish@example.net"]
+        assert ctx["cloud_apps"] == ["Office 365"]
+
+    def test_core_keys_always_present_and_empty_extras_dropped(self):
+        ctx = sentinel._entity_context([])
+        assert ctx == {
+            "src_ips": [],
+            "hostnames": [],
+            "usernames": [],
+            "domains": [],
+            "file_hashes": [],
+        }
+
+    def test_lists_are_capped(self):
+        many = [{"kind": "Ip", "address": f"10.0.0.{n}"} for n in range(200)]
+        ctx = sentinel._entity_context(many)
+        assert len(ctx["src_ips"]) == sentinel._MAX_ENTITIES_PER_KIND
+
+    def test_transform_uses_enriched_entities(self):
+        svc = _service()
+        alert = {**sentinel._incident_to_dict(_incident()), "entities": self._ENTITIES}
+        finding = svc.transform_alert_to_finding(alert)
+        assert finding["entity_context"]["hostnames"] == ["mhk-rg-ws.corp.example"]
+
+    def test_entity_fields_exist_on_the_sdk_models(self):
+        models = pytest.importorskip("azure.mgmt.securityinsight.models")
+        known = set()
+        for name in dir(models):
+            cls = getattr(models, name)
+            if isinstance(cls, type) and name.endswith("Entity"):
+                known |= set(getattr(cls, "_attribute_map", {}))
+        missing_fields = [f for f in sentinel._ENTITY_FIELDS if f not in known]
+        assert missing_fields == []
+
+    @pytest.mark.asyncio
+    async def test_enrich_attaches_entities(self):
+        svc = _service()
+        entity = MagicMock()
+        entity.as_dict.return_value = {
+            "kind": "Host",
+            "host_name": "mhk-rg-ws",
+            "sid": "S-1-5-21-noise",
+        }
+        client = MagicMock()
+        client.incidents.list_entities.return_value = SimpleNamespace(entities=[entity])
+        svc._client = client
+
+        out = await svc.enrich_alert({"id": "inc-1", "title": "t"})
+
+        assert out["entities"] == [{"kind": "Host", "host_name": "mhk-rg-ws"}]
+        client.incidents.list_entities.assert_called_once_with("rg", "ws", "inc-1")
+
+    @pytest.mark.asyncio
+    async def test_enrich_failure_degrades_to_no_entities(self):
+        svc = _service()
+        client = MagicMock()
+        client.incidents.list_entities.side_effect = PermissionError("403")
+        svc._client = client
+        alert = {"id": "inc-1", "title": "t"}
+
+        assert await svc.enrich_alert(alert) == alert
+
+
 def _make_poller(checkpoint=None):
     from services.daemon.config import PollingConfig
     from services.daemon.poller import DataPoller
@@ -254,6 +377,7 @@ def _make_poller(checkpoint=None):
 def _sentinel_service(alerts=()):
     service = MagicMock()
     service.fetch_alerts = AsyncMock(return_value=list(alerts))
+    service.enrich_alert = AsyncMock(side_effect=lambda a: {**a, "enriched": True})
     service.transform_alert_to_finding.side_effect = lambda a: {
         "finding_id": f"sentinel-{a['id']}"
     }
@@ -272,6 +396,8 @@ class TestPoller:
         await poller._poll_ingestion_source("azure_sentinel")
 
         service.ingest_alerts.assert_not_called()
+        # Only the new alert is enriched (one entities call per incident).
+        service.enrich_alert.assert_awaited_once_with({"id": "a"})
         poller._enqueue_finding.assert_awaited_once_with(
             {"finding_id": "sentinel-a"}, "azure_sentinel"
         )

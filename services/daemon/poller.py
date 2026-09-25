@@ -775,6 +775,9 @@ class DataPoller:
         for alert in alerts:
             finding = service.transform_alert_to_finding(alert)
             if finding and not await dedup.is_processed(finding["finding_id"]):
+                # Costly per-alert detail (Sentinel entities) only for new ones.
+                enriched = await service.enrich_alert(alert)
+                finding = service.transform_alert_to_finding(enriched) or finding
                 if await self._enqueue_finding(finding, source):
                     await dedup.mark_processed(finding["finding_id"])
                     new_count += 1

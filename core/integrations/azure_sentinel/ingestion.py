@@ -49,6 +49,99 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value else None
 
 
+# Entity properties worth keeping; the rest (fingerprints, GUIDs, SIDs) only
+# bloat the stored row and the triage prompt.
+_ENTITY_FIELDS = (
+    "friendly_name",
+    "host_name",
+    "dns_domain",
+    "nt_domain",
+    "account_name",
+    "upn_suffix",
+    "address",
+    "url",
+    "domain_name",
+    "hash_value",
+    "algorithm",
+    "file_name",
+    "directory",
+    "mailbox_primary_address",
+    "upn",
+    "recipient",
+    "p1_sender",
+    "p2_sender",
+    "sender_ip",
+    "subject",
+    "app_name",
+)
+
+# Per-list cap in entity_context; an incident can carry hundreds of entities.
+_MAX_ENTITIES_PER_KIND = 50
+
+
+def _entity_to_dict(entity: Any) -> Dict[str, Any]:
+    data = entity.as_dict()
+    kept = {k: data[k] for k in _ENTITY_FIELDS if data.get(k)}
+    kept["kind"] = str(data.get("kind") or "")
+    return kept
+
+
+def _push(values: List[str], value: Any) -> None:
+    if value and value not in values and len(values) < _MAX_ENTITIES_PER_KIND:
+        values.append(str(value))
+
+
+def _entity_context(entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Map Sentinel entities onto the entity_context keys triage reads
+    (src_ips / hostnames / usernames), plus the ones Defender also fills."""
+    ctx: Dict[str, List[str]] = {
+        "src_ips": [],
+        "hostnames": [],
+        "usernames": [],
+        "domains": [],
+        "file_hashes": [],
+        "file_names": [],
+        "email_senders": [],
+        "cloud_apps": [],
+    }
+    for e in entities:
+        kind = e.get("kind", "").lower()
+        if kind == "host":
+            host = e.get("host_name")
+            if host and e.get("dns_domain"):
+                host = f"{host}.{e['dns_domain']}"
+            _push(ctx["hostnames"], host)
+        elif kind == "account":
+            name = e.get("account_name")
+            if name and e.get("upn_suffix"):
+                name = f"{name}@{e['upn_suffix']}"
+            elif name and e.get("nt_domain"):
+                name = f"{e['nt_domain']}\\{name}"
+            _push(ctx["usernames"], name)
+        elif kind == "ip":
+            _push(ctx["src_ips"], e.get("address"))
+        elif kind == "url":
+            _push(ctx["domains"], e.get("url"))
+        elif kind == "dnsresolution":
+            _push(ctx["domains"], e.get("domain_name"))
+        elif kind == "filehash":
+            _push(ctx["file_hashes"], e.get("hash_value"))
+        elif kind == "file":
+            _push(ctx["file_names"], e.get("file_name"))
+        elif kind == "mailbox":
+            _push(ctx["usernames"], e.get("mailbox_primary_address") or e.get("upn"))
+        elif kind == "mailmessage":
+            _push(ctx["usernames"], e.get("recipient"))
+            _push(ctx["email_senders"], e.get("p1_sender"))
+            _push(ctx["email_senders"], e.get("p2_sender"))
+            _push(ctx["src_ips"], e.get("sender_ip"))
+        elif kind == "cloudapplication":
+            _push(ctx["cloud_apps"], e.get("app_name") or e.get("friendly_name"))
+    # Keep the keys every consumer expects; drop empty extras.
+    core = ("src_ips", "hostnames", "usernames", "domains", "file_hashes")
+    return {k: v for k, v in ctx.items() if k in core or v}
+
+
 def _incident_to_dict(incident: Any) -> Dict[str, Any]:
     additional = incident.additional_data
     owner = incident.owner
@@ -72,7 +165,6 @@ def _incident_to_dict(incident: Any) -> Dict[str, Any]:
         "alert_product_names": (
             list(additional.alert_product_names or []) if additional else []
         ),
-        "properties": incident.additional_properties or {},
     }
 
 
@@ -182,6 +274,35 @@ class AzureSentinelIngestion(SIEMIngestionService):
             incidents.append(_incident_to_dict(incident))
         return incidents
 
+    async def enrich_alert(self, alert: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the incident's entities (hosts, accounts, IPs, files, ...).
+
+        The incidents list does not carry them, and they are what triage and
+        enrichment work from. One call per incident, so the poller only asks
+        for incidents that passed dedup. A failure degrades to an incident
+        without entities rather than failing the poll: the incident itself
+        still matters more than the detail.
+        """
+        incident_id = alert.get("id")
+        if not incident_id:
+            return alert
+        try:
+            entities = await asyncio.to_thread(self._list_entities, incident_id)
+        except Exception as e:
+            logger.warning(
+                "Azure Sentinel: entities for incident %s unavailable: %s",
+                incident_id,
+                e,
+            )
+            return alert
+        return {**alert, "entities": entities}
+
+    def _list_entities(self, incident_id: str) -> List[Dict[str, Any]]:
+        result = self._get_client().incidents.list_entities(
+            self.config["resource_group"], self.config["workspace_name"], incident_id
+        )
+        return [_entity_to_dict(e) for e in result.entities or []]
+
     def transform_alert_to_finding(
         self, alert: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
@@ -195,38 +316,51 @@ class AzureSentinelIngestion(SIEMIngestionService):
             Finding dictionary
         """
         try:
-            # Generate finding ID
             finding_id = f"sentinel-{alert.get('id', uuid.uuid4().hex[:12])}"
 
-            # Extract entities
-            entities = self.extract_entities(alert.get("properties", {}))
+            # The findings table has no title column, and Sentinel's
+            # description is usually the analytics rule's generic text. Lead
+            # with the incident title so it survives storage and reaches
+            # triage on the backfill path too.
+            title = alert.get("title") or "Azure Sentinel Incident"
+            detail = (alert.get("description") or "").strip()
+            description = (
+                title if not detail or detail == title else f"{title}\n\n{detail}"
+            )
 
-            # Build finding
-            finding = {
+            entity_context: Dict[str, Any] = _entity_context(
+                alert.get("entities") or []
+            )
+            for key, value in (
+                ("incident_number", alert.get("incident_number")),
+                ("sentinel_status", alert.get("status")),
+                ("owner", alert.get("owner")),
+                ("labels", alert.get("labels")),
+                ("tactics", alert.get("tactics")),
+                ("alert_count", alert.get("alert_count")),
+                ("alert_products", alert.get("alert_product_names")),
+            ):
+                if value:
+                    entity_context[key] = value
+
+            incident_url = alert.get("incident_url")
+            evidence_links = (
+                [{"type": "incident", "ref": incident_url}] if incident_url else None
+            )
+
+            return {
                 "finding_id": finding_id,
-                "title": alert.get("title", "Azure Sentinel Incident"),
-                "description": alert.get("description", ""),
-                "severity": self.normalize_severity(alert.get("severity")),
                 "data_source": "azure_sentinel",
-                "timestamp": alert.get("created_time", utcnow().isoformat()),
-                "raw_data": alert,
-                "metadata": {
-                    "incident_id": alert.get("id"),
-                    "status": alert.get("status"),
-                    "owner": alert.get("owner"),
-                    "labels": alert.get("labels", []),
-                    "tactics": alert.get("tactics", []),
-                    "alert_count": alert.get("alert_count", 0),
-                    "last_updated": alert.get("last_updated_time"),
-                },
-                "entities": entities,
-                "mitre_attack": {
-                    "tactics": alert.get("tactics", []),
-                    "techniques": [],
-                },
+                "timestamp": alert.get("created_time") or utcnow().isoformat(),
+                "severity": self.normalize_severity(alert.get("severity")),
+                "status": "new",
+                "title": title,
+                "description": description,
+                "entity_context": entity_context,
+                "evidence_links": evidence_links,
+                # Incidents carry tactics, not technique IDs.
+                "mitre_predictions": {},
             }
-
-            return finding
 
         except Exception as e:
             logger.error(f"Error transforming Azure Sentinel incident: {e}")
